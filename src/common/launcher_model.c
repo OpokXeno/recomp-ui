@@ -23,8 +23,8 @@ static const int kFreqCount   = (int)(sizeof(kFreqTable) / sizeof(kFreqTable[0])
 
 static const int kWindowWidths[]    = { 960, 1280, 1600, 1920 };
 static const int kWindowWidthCount  = (int)(sizeof(kWindowWidths) / sizeof(kWindowWidths[0]));
-static const int kInterpFpsTable[]  = { 0, 90, 120, 144, 165, 240 };
-static const int kInterpFpsCount    = (int)(sizeof(kInterpFpsTable) / sizeof(kInterpFpsTable[0]));
+static const int kFpsTable[]        = { 30, 60 };
+static const int kFpsCount          = (int)(sizeof(kFpsTable) / sizeof(kFpsTable[0]));
 static const char* kScreenKindNames[4] = { "Raw", "CRT", "Composite", "Trinitron" };
 
 static const char* kButtonNames[LNG_BTN_COUNT] = {
@@ -246,9 +246,9 @@ void launcher_model_init(LauncherModel* m,
     if (m->has_renderer)      m->s.renderer      = m->s.renderer ? 1 : 0;
     if (m->has_frame_interp) {
         int ok = 0;
-        for (int i = 0; i < kInterpFpsCount; ++i)
-            if (kInterpFpsTable[i] == m->s.frame_interp_fps) { ok = 1; break; }
-        if (!ok) m->s.frame_interp_fps = 0;
+        for (int i = 0; i < kFpsCount; ++i)
+            if (kFpsTable[i] == m->s.fps) { ok = 1; break; }
+        if (!ok) m->s.fps = 30;
     }
     if (m->num_languages > 0)
         m->s.language_index = clampi(m->s.language_index, 0, m->num_languages - 1);
@@ -737,21 +737,16 @@ const char* launcher_model_screen_kind_label(const LauncherModel* m) {
     return names[clampi(m->s.screen_kind, 0, n - 1)];
 }
 
-void launcher_model_toggle_frame_interp(LauncherModel* m) {
-    m->s.frame_interp = !m->s.frame_interp;
-}
-
-void launcher_model_cycle_interp_fps(LauncherModel* m) {
+void launcher_model_cycle_fps(LauncherModel* m) {
     int idx = 0;
-    for (int i = 0; i < kInterpFpsCount; ++i)
-        if (kInterpFpsTable[i] == m->s.frame_interp_fps) { idx = i; break; }
-    m->s.frame_interp_fps = kInterpFpsTable[(idx + 1) % kInterpFpsCount];
+    for (int i = 0; i < kFpsCount; ++i)
+        if (kFpsTable[i] == m->s.fps) { idx = i; break; }
+    m->s.fps = kFpsTable[(idx + 1) % kFpsCount];
 }
 
-const char* launcher_model_interp_fps_label(const LauncherModel* m) {
+const char* launcher_model_fps_label(const LauncherModel* m) {
     static char buf[24];
-    if (m->s.frame_interp_fps == 0) return "Display refresh";
-    snprintf(buf, sizeof(buf), "%d fps", m->s.frame_interp_fps);
+    snprintf(buf, sizeof(buf), "%d FPS", m->s.fps == 60 ? 60 : 30);
     return buf;
 }
 

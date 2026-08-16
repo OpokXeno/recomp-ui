@@ -1716,7 +1716,7 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
     // ---- deeper PSX-style surface, capability-gated per control -----------
     // Order matches the original PSX launcher: Window size, Renderer,
     // Supersampling, Aspect ratio, Texture filtering, Antialiasing, Screen
-    // model, Frame interpolation (+Presentation target), Skip FMVs, Turbo
+    // model, FPS, Skip FMVs, Turbo
     // loads, Fullscreen.
     if (m->has_window_size) {
         row_label("Window size", th);
@@ -1737,10 +1737,10 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
         if (ImGui::Checkbox("##intscale", &is)) launcher_model_toggle_integer_scale(m);
     }
 
-    if (m->has_renderer) {
-        row_label("Renderer", th);
-        if (ImGui::Button(launcher_model_renderer_label(m), ImVec2(px(120), px(30))))
-            launcher_model_toggle_renderer(m);
+    if (m->has_frame_interp) {
+        row_label("FPS", th);
+        if (ImGui::Button(launcher_model_fps_label(m), ImVec2(px(150), px(30))))
+            launcher_model_cycle_fps(m);
     }
 
     if (m->has_supersampling) {
@@ -1787,20 +1787,6 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
         // shorter models (e.g. "DMG") center within the same fixed box.
         if (ImGui::Button(launcher_model_screen_kind_label(m), ImVec2(px(220), px(30))))
             launcher_model_cycle_screen_kind(m);
-    }
-
-    // Frame interpolation is only meaningful under OpenGL (Software has no
-    // interpolation pass); Presentation target only matters once frame
-    // interpolation is actually on.
-    if (m->has_frame_interp && m->s.renderer) {
-        row_label("Frame interpolation", th);
-        bool fi = m->s.frame_interp != 0;
-        if (ImGui::Checkbox("##fi", &fi)) launcher_model_toggle_frame_interp(m);
-        if (m->s.frame_interp) {
-            row_label("Presentation target", th);
-            if (ImGui::Button(launcher_model_interp_fps_label(m), ImVec2(px(150), px(30))))
-                launcher_model_cycle_interp_fps(m);
-        }
     }
 
     if (m->has_skip_fmv) {

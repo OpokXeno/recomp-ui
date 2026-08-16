@@ -106,7 +106,7 @@ deeper PSX settings `7fbf0eb`; pad-mode + aspect `0af8918`; namespaced helpers
   when the define is off). Uses `launcher_profile_apply("psx", &gi)` then per-game overrides
   (lock_mode etc.), and maps PSX `UserSettings` ↔ `RecompLauncherCSettings` both
   ways (window_width, renderer, supersampling, antialiasing, texture_filter,
-  screen_kind, frame_interpolation(+fps), spu_hq, auto_skip_fmv, turbo_loads,
+   screen_kind, fps (30/60), spu_hq, auto_skip_fmv, turbo_loads,
   bios_path, deadzone*100/32767, aspect_num/den↔aspect_index, p1/p2_mode↔pad_mode).
 - Ape Escape sets `lock_mode=true` (DualShock-only) → pad-mode selector correctly
   HIDDEN, art locked to analog. aspect_mask 0x7 (4:3/16:9/21:9).

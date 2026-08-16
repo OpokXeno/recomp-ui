@@ -241,6 +241,8 @@ struct RecompLauncherCSettings {
     // transient output and is cleared by the launcher when it initializes.
     char netplay_player_name[64];
     RecompLauncherCNetplayLaunch netplay_launch;
+    // PSX presentation rate: 30 = original cadence, 60 = Native interpolation.
+    int  fps;
 };
 
 // ---- host verification/inspection results (filled by the callbacks below) ----

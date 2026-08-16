@@ -411,9 +411,8 @@ void launcher_model_toggle_texture_filter(LauncherModel* m);   // Nearest/Biline
 const char* launcher_model_texture_filter_label(const LauncherModel* m);
 void launcher_model_cycle_screen_kind(LauncherModel* m);       // Raw/CRT/Composite/Trinitron
 const char* launcher_model_screen_kind_label(const LauncherModel* m);
-void launcher_model_toggle_frame_interp(LauncherModel* m);
-void launcher_model_cycle_interp_fps(LauncherModel* m);        // {0,90,120,144,165,240} wrap
-const char* launcher_model_interp_fps_label(const LauncherModel* m);  // "Display refresh"/"90 fps"
+void launcher_model_cycle_fps(LauncherModel* m);                // {30,60} wrap
+const char* launcher_model_fps_label(const LauncherModel* m);   // "30 FPS"/"60 FPS"
 void launcher_model_toggle_spu_hq(LauncherModel* m);
 void launcher_model_toggle_skip_fmv(LauncherModel* m);
 void launcher_model_toggle_turbo_loads(LauncherModel* m);
