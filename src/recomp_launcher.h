@@ -160,7 +160,7 @@ struct RecompLauncherCSettings {
     // has_* flags below — consoles that don't set the flags leave these unused) ----
     int  window_width;        // px window width (height follows aspect)
     int  renderer;            // 0 = software, 1 = OpenGL
-    int  supersampling;       // 1..4
+    int  supersampling;       // 1..8
     int  antialiasing;        // MSAA sample count: 0 = off, else 2/4/8 (x). (A
                               // legacy on/off host may still write 0/1.)
     int  texture_filter;      // 0 = nearest, 1 = bilinear

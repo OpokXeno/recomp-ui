@@ -403,7 +403,7 @@ void launcher_model_cycle_window_size(LauncherModel* m);       // {960,1280,1600
 const char* launcher_model_window_size_label(const LauncherModel* m);  // "1280 x 960" (H follows aspect)
 void launcher_model_toggle_renderer(LauncherModel* m);         // Software/OpenGL
 const char* launcher_model_renderer_label(const LauncherModel* m);
-void launcher_model_cycle_supersampling(LauncherModel* m);     // 1x..4x wrap
+void launcher_model_cycle_supersampling(LauncherModel* m);     // 1x..8x wrap
 const char* launcher_model_supersampling_label(const LauncherModel* m);
 void launcher_model_cycle_aa(LauncherModel* m);            // Off/2x/4x/8x (MSAA sample count)
 const char* launcher_model_aa_label(const LauncherModel* m);

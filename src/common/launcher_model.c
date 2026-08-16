@@ -233,7 +233,7 @@ void launcher_model_init(LauncherModel* m,
             if (kWindowWidths[i] == m->s.window_width) { ok = 1; break; }
         if (!ok) m->s.window_width = kWindowWidths[0];
     }
-    if (m->has_supersampling) m->s.supersampling = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 4);
+    if (m->has_supersampling) m->s.supersampling = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
     if (m->has_screen_kind) {
         // Clamp against the active profile's screen-model vocabulary (GBA has
         // 5 LCD models; the legacy PSX-era set has 4) — see screen_kind_vocab.
@@ -673,14 +673,17 @@ const char* launcher_model_renderer_label(const LauncherModel* m) {
 }
 
 void launcher_model_cycle_supersampling(LauncherModel* m) {
-    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 4);
-    m->s.supersampling = (v % 4) + 1;
+    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
+    m->s.supersampling = (v % 8) + 1;
 }
 
 const char* launcher_model_supersampling_label(const LauncherModel* m) {
-    static char buf[8];
-    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 4);
-    snprintf(buf, sizeof(buf), "%dx", v);
+    enum { InternalVramWidth = 1024, InternalVramHeight = 512 };
+    static char buf[32];
+    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
+
+    snprintf(buf, sizeof(buf), "%dx (%dx%d)", v,
+             InternalVramWidth * v, InternalVramHeight * v);
     return buf;
 }
 

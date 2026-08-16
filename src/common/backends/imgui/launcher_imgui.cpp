@@ -1745,7 +1745,7 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
 
     if (m->has_supersampling) {
         row_label("Supersampling", th);
-        if (ImGui::Button(launcher_model_supersampling_label(m), ImVec2(px(90), px(30))))
+        if (ImGui::Button(launcher_model_supersampling_label(m), ImVec2(px(160), px(30))))
             launcher_model_cycle_supersampling(m);
     }
 
