@@ -1,26 +1,32 @@
 // launcher_platform_sdl2.c — SDL2 implementation of the shared platform layer.
 //
-// Ships today alongside the game runtime's SDL2, so the launcher integrates
-// in-process with zero migration risk. It implements the SAME launcher_platform.h
-// contract as launcher_platform_sdl3.c, so nothing above this file changes when
-// we later flip to SDL3 for Wayland fractional scaling.
+// Compatibility implementation for SDL2 hosts. It implements the same
+// launcher_platform.h contract as launcher_platform_sdl3.c.
 //
 // DPI on SDL2: SDL_WINDOW_ALLOW_HIGHDPI makes the window size logical (points)
 // while SDL_GL_GetDrawableSize reports physical pixels; their ratio is the
 // content scale. That covers Windows per-monitor, macOS Retina and X11.
 // It does NOT cover Wayland fractional scaling — SDL2 only supports integer
 // buffer scale, so at 125%/150% the compositor downscales and text softens.
-// That single gap is the entire reason for the SDL3 follow-up.
+// SDL3 is the preferred path for fractional Wayland scaling.
 
 #include <stdlib.h>
 #include "launcher_platform.h"
+#include "launcher_boot_timing.h"
 
 #include <stdio.h>
+
+static bool s_quit_sdl = true;
+
+void launcher_platform_set_quit_sdl(bool quit_sdl) {
+    s_quit_sdl = quit_sdl;
+}
 
 bool launcher_platform_open(LauncherPlatform* p, const char* title,
                             int logical_w, int logical_h) {
     if (!p) return false;
     SDL_zerop(p);
+    launcher_boot_timing_mark("rui:platform_open:begin");
 
     SDL_SetMainReady();   // we built with SDL_MAIN_HANDLED (real main() is entry)
 #if defined(_WIN32)
@@ -29,6 +35,16 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
     SDL_SetHint("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
     SDL_SetHint("SDL_WINDOWS_DPI_SCALING", "0");
 #endif
+#if defined(__ANDROID__)
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
+    SDL_SetHintWithPriority("SDL_JOYSTICK_HIDAPI_PS5", "1",
+                            SDL_HINT_DEFAULT);
+    // Bluetooth DualSense controllers start in basic-report mode. Requesting
+    // enhanced reports exposes their motion sensors through SDL's standard
+    // game-controller sensor API; USB controllers already use this mode.
+    SDL_SetHintWithPriority("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1",
+                            SDL_HINT_DEFAULT);
 #ifdef LNG_GLES2
     // The host links ANGLE's libGLESv2/libEGL; SDL must create the context
     // through that same ES library (via EGL), or the directly-linked ANGLE
@@ -36,7 +52,8 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
     // Must be set BEFORE SDL_Init. Mirrors gb-recompiled's own platform init.
     SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
 #endif
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {   // SDL2: 0 == success
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER |
+                 SDL_INIT_SENSOR) != 0) {   // SDL2: 0 == success
         fprintf(stderr, "[launcher] SDL_Init failed: %s\n", SDL_GetError());
         return false;
     }
@@ -71,14 +88,18 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
             if (v > 1.0f && v <= 4.0f) { win_w = (int)(logical_w * v); win_h = (int)(logical_h * v); }
         }
     }
+    Uint32 window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                          SDL_WINDOW_ALLOW_HIGHDPI;
+#if defined(__ANDROID__)
+    window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_BORDERLESS;
+#endif
     p->window = SDL_CreateWindow(title ? title : "Launcher",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  win_w, win_h,
-                                 SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
-                                 SDL_WINDOW_ALLOW_HIGHDPI);
+                                 window_flags);
     if (!p->window) {
         fprintf(stderr, "[launcher] SDL_CreateWindow failed: %s\n", SDL_GetError());
-        SDL_Quit();
+        if (s_quit_sdl) SDL_Quit();
         return false;
     }
 
@@ -87,7 +108,7 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
         fprintf(stderr, "[launcher] SDL_GL_CreateContext failed: %s\n", SDL_GetError());
         SDL_DestroyWindow(p->window);
         p->window = NULL;
-        SDL_Quit();
+        if (s_quit_sdl) SDL_Quit();
         return false;
     }
 
@@ -97,6 +118,7 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
     SDL_RaiseWindow(p->window);   // foreground + keyboard focus (gamepad/kbd nav)
 
     launcher_platform_refresh_metrics(p);
+    launcher_boot_timing_mark("rui:platform_open:window+gl_ready");
     return true;
 }
 
@@ -151,8 +173,10 @@ void launcher_platform_close(LauncherPlatform* p) {
     if (p->gl)     { SDL_GL_DeleteContext(p->gl); p->gl = NULL; }
     if (p->window) { SDL_DestroyWindow(p->window); p->window = NULL; }
     SDL_GL_ResetAttributes();   // leave a clean slate for the game's SDL usage
-    /* Full SDL_Quit: intentional. Soft-return rematch hosts MUST re-SDL_Init
-     * (video+audio+gamecontroller) before recreating the game window — see
-     * docs/HOST_NETPLAY.md. Do not remove without a coordinated host change. */
-    SDL_Quit();
+    /* Soft-return rematch hosts that skip SDL_Quit (s_quit_sdl=false) keep the
+     * subsystem alive across launcher↔game transitions. When we do quit, hosts
+     * MUST re-SDL_Init (video+audio+gamecontroller) before recreating the game
+     * window — see docs/HOST_NETPLAY.md. */
+    if (s_quit_sdl)
+        SDL_Quit();
 }

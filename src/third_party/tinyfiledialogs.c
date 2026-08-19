@@ -1703,7 +1703,10 @@ wchar_t * tinyfd_saveFileDialogW(
 						wcscpy(lDialogString, lFilterPatterns);
 						wcscat(lFilterPatterns, lDialogString);
 				}
-				wcscat(lFilterPatterns, L"All Files\n*.*\n");
+				/* Do NOT append "All Files *.*" when the caller supplied
+				 * patterns (e.g. PSX *.cue only). That undoes the filter in
+				 * the Win32 dialog — same policy as recomp-ui's Linux zenity
+				 * path in launcher_files.c. */
 				p = lFilterPatterns;
 				while ((p = wcschr(p, L'\n')) != NULL)
 				{
@@ -1827,7 +1830,10 @@ wchar_t * tinyfd_openFileDialogW(
 				wcscpy(lDialogString, lFilterPatterns);
 				wcscat(lFilterPatterns, lDialogString);
 			}
-			wcscat(lFilterPatterns, L"All Files\n*.*\n");
+			/* Do NOT append "All Files *.*" when the caller supplied
+			 * patterns (e.g. PSX *.cue only). That undoes the filter in
+			 * the Win32 dialog — same policy as recomp-ui's Linux zenity
+			 * path in launcher_files.c. */
 			p = lFilterPatterns;
 			while ((p = wcschr(p, L'\n')) != NULL)
 			{

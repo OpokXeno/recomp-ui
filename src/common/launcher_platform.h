@@ -11,12 +11,12 @@
 #ifndef LAUNCHER_NG_PLATFORM_H
 #define LAUNCHER_NG_PLATFORM_H
 
-// One switch selects the windowing backend for the whole launcher. SDL2 is the
-// shipping default (it matches the game runtime, so the launcher links
-// in-process with no migration); SDL3 is the follow-up that adds Wayland
-// fractional scaling. Everything above this header is identical either way.
+// One switch selects the windowing backend for the whole launcher. SDL3 is used
+// by current PSXRecomp hosts; SDL2 remains available to older consumers.
+// Everything above this header is identical either way.
 #if defined(LNG_SDL3)
   #include <SDL3/SDL.h>
+  #include <SDL3/SDL_main.h>
 #else
   #include <SDL.h>
 #endif
@@ -58,7 +58,15 @@ void launcher_platform_present(LauncherPlatform* p);
 
 // Tear down GL context + window and reset GL attributes, so the game runtime's
 // SDL layer starts from a clean slate afterward.
+// By default this also calls SDL_Quit(). Hosts that already initialized SDL and
+// will continue using it after the launcher (typical in-process game boot)
+// should call launcher_platform_set_quit_sdl(false) first so subsystems stay up.
 void launcher_platform_close(LauncherPlatform* p);
+
+// When quit_sdl is false, launcher_platform_close destroys only the launcher
+// window/GL context and leaves SDL initialized for the host. Default is true
+// (standalone launcher harnesses expect a full teardown).
+void launcher_platform_set_quit_sdl(bool quit_sdl);
 
 #ifdef __cplusplus
 }

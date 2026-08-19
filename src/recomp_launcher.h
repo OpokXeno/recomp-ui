@@ -1,8 +1,8 @@
-// recomp_launcher.h — C-callable entry point for the recomp-ui launcher.
+﻿// recomp_launcher.h â€” C-callable entry point for the recomp-ui launcher.
 //
 // A host app's C main() can't speak the C++ Dear ImGui launcher internals
 // directly, so this shim wraps it: it creates its own SDL/GL window, runs the
-// launcher, maps a plain-C settings struct in/out, and tears the window down —
+// launcher, maps a plain-C settings struct in/out, and tears the window down â€”
 // leaving the host to just seed/read the struct and pick up the chosen ROM
 // path.
 
@@ -11,6 +11,15 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+/* Mod support is framework-available but developer opt-in. The integration
+ * helper defines this from its default-OFF RECOMP_UI_ENABLE_MODS CMake option.
+ * Keep a source-level default for hosts that compile the launcher sources
+ * without recomp_ui.cmake. The public provider ABI remains visible either way
+ * so enabling the option never changes C struct layouts. */
+#ifndef RECOMP_UI_ENABLE_MODS
+#define RECOMP_UI_ENABLE_MODS 0
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,13 +32,41 @@ extern "C" {
 // leaves new slots in the same "none" state they had implicitly before.
 // Every consumer compiles this header from source (submodule pin), so the
 // layout change is absorbed by the consumer's normal rebuild on a pin bump.
-#define RECOMP_LAUNCHER_MAX_PLAYERS 5
+#define RECOMP_LAUNCHER_MAX_PLAYERS 8
+/* Host may #ifdef this when reading player_gamepad_guid[] from settings. */
+#define RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID 1
+/* Host may #ifdef this when reading multitap_enabled from settings. */
+#define RECOMP_LAUNCHER_HAS_MULTITAP_ENABLED 1
+/* Host may #ifdef this when reading multitap_analog (DualShock-on-tap hack). */
+#define RECOMP_LAUNCHER_HAS_MULTITAP_ANALOG 1
+/* Host may #ifdef this when reading Settings.rewind_depth. */
+#define RECOMP_LAUNCHER_HAS_REWIND_DEPTH 1
+/* Host may #ifdef this when reading Settings.rewind_interval. */
+#define RECOMP_LAUNCHER_HAS_REWIND_INTERVAL 1
+/* Host may #ifdef this when reading Settings.vsync. */
+#define RECOMP_LAUNCHER_HAS_VSYNC 1
+#define RECOMP_LAUNCHER_MAX_BINDINGS 24
+#define RECOMP_LAUNCHER_MAX_ASSIST_BINDINGS 8
 
-// N64 Transfer Pak slots — one per controller port.
+/* Portable encoding used by host-owned controller bindings. Button and axis
+ * numbers are SDL's standard game-controller indices; zero remains unbound. */
+#define RECOMP_LAUNCHER_PAD_BUTTON(code) (1 + (code))
+#define RECOMP_LAUNCHER_PAD_AXIS(code, positive) \
+    (100 + ((code) * 2) + ((positive) ? 1 : 0))
+#define RECOMP_LAUNCHER_PAD_BUTTON_COMBO(mask) (1000 + (mask))
+#define RECOMP_LAUNCHER_PAD_IS_BUTTON(value) ((value) > 0 && (value) < 100)
+#define RECOMP_LAUNCHER_PAD_IS_AXIS(value) ((value) >= 100 && (value) < 1000)
+#define RECOMP_LAUNCHER_PAD_IS_BUTTON_COMBO(value) ((value) >= 1000)
+#define RECOMP_LAUNCHER_PAD_BUTTON_CODE(value) ((value) - 1)
+#define RECOMP_LAUNCHER_PAD_AXIS_CODE(value) (((value) - 100) / 2)
+#define RECOMP_LAUNCHER_PAD_AXIS_POSITIVE(value) (((value) - 100) & 1)
+#define RECOMP_LAUNCHER_PAD_BUTTON_COMBO_MASK(value) ((value) - 1000)
+
+// N64 Transfer Pak slots â€” one per controller port.
 #define RECOMP_LAUNCHER_MAX_TPAKS 4
 
-/* Netplay lobby membership ceiling (matches MAX_PLAYERS / PSX multitap). */
-#define RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS 5
+/* Netplay lobby membership ceiling (party games up to 8). */
+#define RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS 8
 
 typedef struct RecompLauncherCSettings RecompLauncherCSettings;
 
@@ -41,6 +78,8 @@ typedef struct RecompLauncherCNetplayLobby {
     int  player_count;
     int  max_slots;
     int  has_password;
+    /* Round-trip ms to the lobby host; -1 when unknown / timed out. */
+    int  latency_ms;
 } RecompLauncherCNetplayLobby;
 
 typedef struct RecompLauncherCNetplayMember {
@@ -48,17 +87,52 @@ typedef struct RecompLauncherCNetplayMember {
     char display_name[64];
     int  ready;
     int  is_host;
+    /* Round-trip ms from the local peer *to* this seat; -1 unknown / self. */
+    int  latency_ms;
+    /* 1 when this row is the local client's seat (never show self-RTT). */
+    int  is_local;
+    /* Peer BIOS offer from set_ready (0 if legacy / missing). */
+    int  bios_offer_valid;
+    int  bios_can_scph1001;
+    int  bios_prefer_openbios;
 } RecompLauncherCNetplayMember;
+
+typedef struct RecompLauncherCNetplayNeedMod {
+    char id[96];
+    char version[32];
+    char name[64];
+    int  builtin;
+    uint32_t size;
+} RecompLauncherCNetplayNeedMod;
 
 typedef struct RecompLauncherCNetplayLaunch {
     int      enabled;
     int      local_slot;
+    /* Host PlayerInput index to sample for this peer. -1 = auto (prefer
+     * dashboard P1 / NETPLAY card; else seat card; else sole assigned). */
     int      input_player;
     char     bind_hostport[64];
     char     peer_hostport[64];
     uint32_t session_id;
     int      input_delay;
-    int      max_slots; /* session pad count (2..RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS) */
+    /* Rollback invent runway (P). Unused when rollback == 0. Clamped 2..16. */
+    int      input_prediction;
+    int      max_slots; /* lobby seat ceiling (2..RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS) */
+    /* Seated players at launch â€” delay-sync slot_count. 0 = unknown / use max_slots. */
+    int      player_count;
+    /* Bit i = lobby seat i occupied at launch. 0 = treat all seats occupied.
+     * Sparse rooms (moved seats) must set holes clear so netplay does not
+     * wait on empty remotes. */
+    uint32_t occupied_mask;
+    /* Host match_caps: lobby UDP SFU star (0/1). Online WS start always
+     * opens the SFU; this flag stays for launch/diagnostics. LAN/direct
+     * keeps host-as-relay / P2P when unset. */
+    int      force_input_relay;
+    /* Host match_caps: Force TURN delay-floor hint (0/1). Online transport
+     * is always lobby SFU (Â§108) â€” this no longer selects ICE relay. */
+    int      force_turn;
+    /* Host match_caps: rollback invent/episode path (0/1; lobby default on). */
+    int      rollback;
 } RecompLauncherCNetplayLaunch;
 
 typedef struct RecompLauncherCNetplayLocalAddress {
@@ -88,18 +162,20 @@ typedef struct RecompLauncherCNetplayCallbacks {
     int  (*external_ip)(void* ctx, char* out, size_t out_len);
     /* Lobby operations return 0 when the request was accepted.
      * create: host_endpoint is in/out (capacity >= 64). recomp-ui applies the
-     * universal UDP port policy before calling this — LAN keeps the exact port
+     * universal UDP port policy before calling this â€” LAN keeps the exact port
      * (UI blocks create when busy); online may already have rewritten the port
      * to the first free value in preferred..preferred+31. Hosts should publish
      * the given endpoint as-is. Returns -4 only as a defensive fallback when
      * the host itself cannot use the port (UI surfaces the same messages).
      * lan_only != 0: publish only the local LAN registry (no lobby server).
      * lan_only == 0: publish only on the lobby server (no LAN registry). */
+    /* max_slots: 2..RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS, clamped by the host
+     * to the game's supported player count. */
     int  (*create)(void* ctx, const char* lobby_name, char* host_endpoint,
                    const char* password, const RecompLauncherCSettings* settings,
-                   int lan_only);
+                   int lan_only, int max_slots);
     /* join: guest_bind is in/out (capacity >= 64). recomp-ui applies the
-     * universal guest UDP bind policy before calling — prefer 7778, then
+     * universal guest UDP bind policy before calling â€” prefer 7778, then
      * 7778+1 .. +31, written as "0.0.0.0:<port>". Hosts should advertise that
      * bind on the lobby join (never rewrite to :0). Engines may still normalize
      * NULL/empty/host:0 as a defensive fallback. */
@@ -130,11 +206,251 @@ typedef struct RecompLauncherCNetplayCallbacks {
                               RecompLauncherCNetplayLocalAddress* out);
     /* Host-only: remove the player in `slot` (not the host). Optional. */
     int  (*kick_member)(void* ctx, int slot);
-    /* Optional: latest lobby error code (need_players, missing_endpoints, …).
+    /* Optional: latest lobby error code (need_players, missing_endpoints, â€¦).
      * Cleared by the host after the UI reads it, or when a later op succeeds. */
     const char* (*last_error)(void* ctx);
     void (*clear_last_error)(void* ctx);
+    /* Optional host waiting-room settings. input_delay is frames, clamped 2..20. */
+    int  (*input_delay_get)(void* ctx);
+    int  (*input_delay_set)(void* ctx, int delay_frames);
+    /* Optional: lobby UDP SFU preference (0/1). Online start always SFU;
+     * LAN/direct may clear this for host-as-relay. */
+    int  (*force_input_relay_get)(void* ctx);
+    int  (*force_input_relay_set)(void* ctx, int force);
+    /* Optional: current room seat ceiling (2..RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS).
+     * 0 when not in a lobby / unknown. Prefer this over game num_players. */
+    int  (*lobby_max_slots)(void* ctx);
+    /* Optional: host Force TURN delay-floor hint (0/1). Server lobbies only;
+     * published in match_caps.force_turn. Does not change online transport. */
+    int  (*force_turn_get)(void* ctx);
+    int  (*force_turn_set)(void* ctx, int force);
+    /* Optional: host Rollback (0/1). Published in match_caps.rollback;
+     * peers apply via PSX_NET_MODE / launch.rollback. Lobby default on. */
+    int  (*rollback_get)(void* ctx);
+    int  (*rollback_set)(void* ctx, int enable);
+    /* Optional host invent runway (P), frames, clamped 2..16. Rollback only. */
+    int  (*input_prediction_get)(void* ctx);
+    int  (*input_prediction_set)(void* ctx, int prediction_frames);
+    /* Optional: DualShock-on-multitap-tap hack (0/1). Host publishes in
+     * match_caps.multitap_analog; peers apply at match start. */
+    int  (*multitap_analog_get)(void* ctx);
+    int  (*multitap_analog_set)(void* ctx, int enable);
+    /* Optional: 1 while lobby DNS/TCP/WS upgrade runs off-thread. */
+    int  (*connecting)(void* ctx);
+    /* Optional pre-join missing-mod handshake. Join returns last_error
+     * "need_mods" without seating; the peer is prompted to download. */
+    int  (*need_mods_count)(void* ctx);
+    int  (*need_mods_get)(void* ctx, int index, RecompLauncherCNetplayNeedMod* out);
+    int  (*need_mods_can_transfer)(void* ctx);
+    int  (*mod_xfer_start)(void* ctx);
+    void (*mod_xfer_cancel)(void* ctx);
+    /* -1 idle, -2 fail, 0..100 in flight. */
+    int  (*mod_xfer_progress)(void* ctx);
+    int  (*mod_xfer_failed)(void* ctx, char* err, size_t err_cap);
 } RecompLauncherCNetplayCallbacks;
+
+/* ---- schema-driven mods --------------------------------------------------
+ * The host owns package parsing, persistence, dependency resolution, and
+ * installation. recomp-ui only renders this stable query/mutation surface.
+ * All strings are copied into fixed buffers so provider implementations may
+ * rebuild their catalogs after any mutation without dangling UI pointers. */
+#define RECOMP_LAUNCHER_MOD_ID_MAX 96
+#define RECOMP_LAUNCHER_MOD_VALUE_MAX 128
+#define RECOMP_LAUNCHER_MOD_AUTHOR_LINK_MAX 8
+#define RECOMP_LAUNCHER_MOD_PATH_MAX 1024
+
+typedef struct RecompLauncherCModAuthorLink {
+    char name[64];
+    char url[256];
+} RecompLauncherCModAuthorLink;
+
+typedef enum RecompLauncherCModOptionType {
+    RECOMP_MOD_OPTION_BOOLEAN = 0,
+    RECOMP_MOD_OPTION_CHOICE = 1,
+    RECOMP_MOD_OPTION_INTEGER = 2,
+    /* Free-text row (single line). The host's set_option is the validator:
+     * the edited value is committed when the field loses focus after an
+     * edit, and a rejected commit reverts the row to the model's value (the
+     * host should surface why via last_error). Appended additively; only
+     * games whose providers supply a TEXT option ever render one. */
+    RECOMP_MOD_OPTION_TEXT = 3,
+} RecompLauncherCModOptionType;
+
+typedef struct RecompLauncherCModPackage {
+    char id[RECOMP_LAUNCHER_MOD_ID_MAX];
+    char version[32];
+    char name[128];
+    char author[96];
+    RecompLauncherCModAuthorLink author_links[RECOMP_LAUNCHER_MOD_AUTHOR_LINK_MAX];
+    int  author_link_count;
+    char description[512];
+    char license[64];
+    char source_name[128];
+    char source_url[256];
+    char status[256];
+    int  enabled;
+    int  option_count;
+    int  removable;
+    int  has_error;
+} RecompLauncherCModPackage;
+
+/* A package may contribute any number of independently configurable features.
+ * Feature identity is the (package_id, id) pair; feature ids only need to be
+ * unique within their owning package. */
+typedef struct RecompLauncherCModFeature {
+    char id[RECOMP_LAUNCHER_MOD_ID_MAX];
+    char package_id[RECOMP_LAUNCHER_MOD_ID_MAX];
+    char package_version[32];
+    char package_name[128];
+    char name[128];
+    char author[96];
+    RecompLauncherCModAuthorLink author_links[RECOMP_LAUNCHER_MOD_AUTHOR_LINK_MAX];
+    int  author_link_count;
+    char description[512];
+    char source_name[128];
+    char source_url[256];
+    char group[96];
+    char status[256];
+    int  enabled;
+    int  option_count;
+    int  has_error;
+    /* Feature exposes a live 3D camera. When enabled, the Controller page
+     * conditionally presents camera bindings and the Mods detail links there.
+     * Appended for ABI stability; zero keeps every existing feature unchanged. */
+    int  camera_controls;
+} RecompLauncherCModFeature;
+
+typedef struct RecompLauncherCModOption {
+    char id[RECOMP_LAUNCHER_MOD_ID_MAX];
+    char label[128];
+    char description[512];
+    char group[96];
+    char value[RECOMP_LAUNCHER_MOD_VALUE_MAX];
+    char default_value[RECOMP_LAUNCHER_MOD_VALUE_MAX];
+    int  type;          /* RecompLauncherCModOptionType */
+    int64_t min_value;
+    int64_t max_value;
+    int64_t step;
+    int  choice_count;
+    /* Non-zero when another option in the same feature currently overrides
+     * this one (manifest key: disabled_by). The provider resolves it, so the
+     * UI only has to grey the control out -- it never cross-references
+     * options itself. Example: ticking "Instant" makes the speed box inert. */
+    int  disabled;
+} RecompLauncherCModOption;
+
+typedef struct RecompLauncherCModChoice {
+    char value[RECOMP_LAUNCHER_MOD_VALUE_MAX];
+    char label[128];
+} RecompLauncherCModChoice;
+
+typedef struct RecompLauncherCModVersion {
+    char version[32];
+    int selected;
+    int removable;
+} RecompLauncherCModVersion;
+
+typedef enum RecompLauncherCModDiagnosticSeverity {
+    RECOMP_MOD_DIAGNOSTIC_INFO = 0,
+    RECOMP_MOD_DIAGNOSTIC_WARNING = 1,
+    RECOMP_MOD_DIAGNOSTIC_ERROR = 2,
+} RecompLauncherCModDiagnosticSeverity;
+
+typedef struct RecompLauncherCModDiagnostic {
+    int  severity; /* RecompLauncherCModDiagnosticSeverity */
+    char resource[192];
+    char message[512];
+    char related_package_id[RECOMP_LAUNCHER_MOD_ID_MAX];
+    char related_feature_id[RECOMP_LAUNCHER_MOD_ID_MAX];
+} RecompLauncherCModDiagnostic;
+
+/* Owner-supplied files required by a feature, such as a source ROM used by a
+ * character port. Providers validate identity; the UI only chooses a path and
+ * displays the provider's verdict. Paths are never copied into a package. */
+typedef struct RecompLauncherCModResource {
+    char id[RECOMP_LAUNCHER_MOD_ID_MAX];
+    char label[128];
+    char description[512];
+    char path[RECOMP_LAUNCHER_MOD_PATH_MAX];
+    char status[256];
+    /* Comma-separated native-dialog patterns, e.g. "*.z64,*.v64,*.n64". */
+    char file_patterns[128];
+    char file_description[128];
+    int required;
+    int verified;
+    /* "file" (default) or "directory". Appended for source compatibility. */
+    char format[64];
+} RecompLauncherCModResource;
+
+typedef struct RecompLauncherCModProvider {
+    void* ctx;
+    int (*package_count)(void* ctx);
+    int (*package_get)(void* ctx, int index, RecompLauncherCModPackage* out);
+    int (*option_get)(void* ctx, const char* package_id, int index,
+                      RecompLauncherCModOption* out);
+    int (*choice_get)(void* ctx, const char* package_id, const char* option_id,
+                      int index, RecompLauncherCModChoice* out);
+    int (*version_count)(void* ctx, const char* package_id);
+    int (*version_get)(void* ctx, const char* package_id, int index,
+                       RecompLauncherCModVersion* out);
+    /* Mutations return 1 on success and 0 on failure. */
+    int (*install_archive)(void* ctx, const char* archive_path);
+    int (*remove_package)(void* ctx, const char* package_id, const char* version);
+    int (*set_enabled)(void* ctx, const char* package_id, int enabled);
+    int (*select_version)(void* ctx, const char* package_id, const char* version);
+    int (*set_option)(void* ctx, const char* package_id, const char* option_id,
+                      const char* value);
+    /* Resolve and persist the staged selection. Called before PLAY commits.
+     * image_path is the ROM/disc currently selected in the launcher. */
+    int (*commit)(void* ctx, const char* image_path);
+    const char* (*last_error)(void* ctx);
+    /* Feature-oriented surface. Appended for ABI stability. New providers
+     * should implement this complete group; package callbacks above remain the
+     * secondary install/version/removal surface. Feature identity is always
+     * (package_id, feature_id). */
+    int (*feature_count)(void* ctx);
+    int (*feature_get)(void* ctx, int index, RecompLauncherCModFeature* out);
+    int (*feature_option_get)(void* ctx, const char* package_id,
+                              const char* feature_id, int index,
+                              RecompLauncherCModOption* out);
+    int (*feature_choice_get)(void* ctx, const char* package_id,
+                              const char* feature_id, const char* option_id,
+                              int index, RecompLauncherCModChoice* out);
+    int (*feature_enable)(void* ctx, const char* package_id,
+                          const char* feature_id, int enabled);
+    int (*feature_set_option)(void* ctx, const char* package_id,
+                              const char* feature_id, const char* option_id,
+                              const char* value);
+    int (*diagnostic_count)(void* ctx, const char* package_id,
+                            const char* feature_id);
+    int (*diagnostic_get)(void* ctx, const char* package_id,
+                          const char* feature_id, int index,
+                          RecompLauncherCModDiagnostic* out);
+    /* Optional package vocabulary. NULL keeps the historical PSX defaults.
+     * extension includes its leading dot, e.g. ".gbamod". */
+    const char* archive_extension;
+    const char* archive_description;
+    /* Optional. Netplay lobbies (hosted / LAN / direct) call this instead of
+     * commit() so matches stay vanilla. Must clear any in-session mod plan
+     * without mutating the user's persisted offline selection. NULL means
+     * "skip commit entirely" (no mods applied for that launch). Appended for
+     * ABI stability â€” zero-init leaves it NULL. */
+    int (*commit_netplay)(void* ctx, const char* image_path);
+    /* Optional owner-resource surface. Appended for source compatibility in
+     * the statically paired runner/UI build; this struct does not yet expose a
+     * negotiated byte size for loading an older binary provider object.
+     * Feature enable and commit remain authoritative gates; the UI verdict
+     * alone is never sufficient. */
+    int (*feature_resource_count)(void* ctx, const char* package_id,
+                                  const char* feature_id);
+    int (*feature_resource_get)(void* ctx, const char* package_id,
+                                const char* feature_id, int index,
+                                RecompLauncherCModResource* out);
+    int (*feature_resource_set_path)(void* ctx, const char* package_id,
+                                     const char* feature_id,
+                                     const char* resource_id,
+                                     const char* path);
+} RecompLauncherCModProvider;
 
 // Plain-C mirror of the launcher's internal settings (bools as int).
 struct RecompLauncherCSettings {
@@ -157,7 +473,7 @@ struct RecompLauncherCSettings {
     int  aspect_index;      // 0 = 4:3, 1 = 16:9, 2 = 21:9
 
     // ---- deeper PSX-style settings (capability-gated; see RecompLauncherCGameInfo
-    // has_* flags below — consoles that don't set the flags leave these unused) ----
+    // has_* flags below â€” consoles that don't set the flags leave these unused) ----
     int  window_width;        // px window width (height follows aspect)
     int  renderer;            // 0 = software, 1 = OpenGL
     int  supersampling;       // 1..8
@@ -174,7 +490,7 @@ struct RecompLauncherCSettings {
     char bios_path[512];      // BIOS file path (empty = default)
 
     // ---- PSX-style memory-card save slots (SAVE_MEMCARD; see launcher_system.h
-    // SaveSpec) — appended at the end to keep this struct additive/ABI-stable.
+    // SaveSpec) â€” appended at the end to keep this struct additive/ABI-stable.
     // Per-slot card-image file path (empty = none picked yet), editable via the
     // Save panel's Browse/New controls; mirrors bios_path's pattern exactly.
     char memcard_path[2][512];
@@ -186,7 +502,7 @@ struct RecompLauncherCSettings {
 
     // ---- audio output device (GameInfo.audio_device_labels consoles) --------
     // The chosen device's display name as enumerated by the HOST (SDL device
-    // names are stable across runs on the same machine, not across machines —
+    // names are stable across runs on the same machine, not across machines â€”
     // exactly the contract the N64 SS Anne launcher's launcher.cfg used).
     // "" = system default. Appended additively.
     char audio_device[128];
@@ -218,15 +534,15 @@ struct RecompLauncherCSettings {
     // Left/Right/Middle mouse button -> index into the active profile's
     // ControllerSpec.buttons[] (0..button_count-1), or -1 = none/unbound.
     // NOTE: 0 is a VALID index (the n64 profile's "A"), so 0 is NOT "unset"
-    // here — the host seeds real defaults ({A, Z, none} = {0, 2, -1}).
+    // here â€” the host seeds real defaults ({A, Z, none} = {0, 2, -1}).
     int   mouse_bind[3];
     // ---- NES-style settings (capability-gated; see has_integer_scale /
-    // hdpack_supported below) — appended additively, same ABI convention. ----
+    // hdpack_supported below) â€” appended additively, same ABI convention. ----
     int  integer_scale;       // bool: snap the game image to integer multiples
     int  hdpack_enabled;      // bool: load a Mesen-format HD texture pack
     char hdpack_dir[512];     // folder containing the pack's hires.txt
     // ---- Genesis-style widescreen width (SystemProfile.video.widescreen_cells
-    // consoles only) — how many extra 8-px background cells EACH SIDE renders
+    // consoles only) â€” how many extra 8-px background cells EACH SIDE renders
     // while `widescreen` is on. 0 = unset (host predates this field) -> the
     // model defaults it to 8, the Genesis engine default. Appended additively.
     int  widescreen_cells;    // 1..16
@@ -241,9 +557,138 @@ struct RecompLauncherCSettings {
     // transient output and is cleared by the launcher when it initializes.
     char netplay_player_name[64];
     RecompLauncherCNetplayLaunch netplay_launch;
-    // PSX presentation rate: 30 = original cadence, 60 = Native interpolation.
-    int  fps;
+
+    // ---- per-player SDL gamepad GUID (player_src==2). Empty when none/keyboard.
+    // Appended additively; see RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID. Hosts
+    // persist these as pN_device in settings.toml so multi-pad assignments
+    // survive relaunches (instance IDs do not).
+    char player_gamepad_guid[RECOMP_LAUNCHER_MAX_PLAYERS][40];
+
+    // ---- controller motion (GameInfo.has_gyro_controls games) ------------
+    // Multiplier applied by the host to a controller's angular-rate sensor.
+    // 0 means unset and is seeded to 1.0 by the launcher model.
+    float gyro_sensitivity;    // 0.25..4.00, 1.00 = game default
+
+    // ---- optional presentation enhancements (capability-gated) -----------
+    // Appended additively so zero-initialized existing consumers keep their
+    // current settings surface and behavior.
+    int sharp_filter;           // integer prescale + fractional linear finish
+    int affine_filter;          // selective game-authorized affine smoothing
+
+    // ---- cartridge light sensor (GameInfo.has_solar_sensor games) ---------
+    // Appended additively. A few GBA cartridges carry a photodiode the game
+    // reads as gameplay input -- Boktai's Gun del Sol charges from real
+    // sunlight -- so "how bright is it where the player is" is a launch
+    // setting, not an emulator preference.
+    //
+    // solar_zip is a POSTAL CODE, deliberately text: many are not numeric
+    // ("SW1A", "K1A"). Empty means the host must not consult any network.
+    char solar_zip[16];
+    char solar_country[8];      // Zippopotam-style code: us, ca, gb, de, ...
+    int  solar_source;          // 0 = live local weather, 1 = fixed level
+    int  solar_manual_step;     // 0..8, used when solar_source == 1
+    int  solar_full_sun;        // W/m^2 that reads as full sun; 0 = host default
+
+    // ---- multi-display layout --------------------------------------------
+    // Index into GameInfo.display_layout_labels. This is intentionally
+    // independent of aspect/widescreen: it describes physical host windows,
+    // not how a game's camera is rendered inside one of them.
+    int display_layout;
+    // ---- PSX geometry-precision settings (capability-gated by
+    // GameInfo.has_geometry_precision) â€” appended additively, same ABI
+    // convention as every block above. ----
+    // The PS1's GTE projects in 16.16 and then discards the fraction when it
+    // saturates screen coordinates to whole pixels, so a moving mesh shimmers;
+    // and the GPU interpolates UVs affinely, so large floor/wall textures swim.
+    // These are the two opt-in corrections. Both are visual only â€” the
+    // guest-visible GTE screen coordinates stay integer and fully faithful.
+    // 0 = off (the faithful default on a fresh config).
+    int  geometry_correction;    // bool: sub-pixel vertex precision
+    int  perspective_texturing;  // bool: perspective-correct UVs
+
+    // ---- PSX multitap (SCPH-1070) ----------------------------------------
+    // Appended additively. When a PSX game advertises num_players >= 3, the
+    // launcher can hide seats beyond the two native ports until multitap is
+    // on. 0 = off, 1 = on. Hosts should seed from settings (psxrecomp
+    // defaults ON when unset). Netplay lobbies with more than 2 seats always
+    // arm multitap in the runtime regardless of this flag.
+    int  multitap_enabled;
+
+    // Opt-in DualShock-on-multitap-tap hack (0 off, 1 on). Persisted to
+    // settings.toml and game.toml [controller] multitap_analog. Hosts may
+    // also publish it in match_caps for the session.
+    int  multitap_analog;
+
+    // ---- optional host assist/cheat gate ---------------------------------
+    // A game that sets GameInfo.has_assist_tools exposes this value in a
+    // dedicated launcher view. The host decides which runtime actions it
+    // gates. Appended additively so existing consumers remain unchanged.
+    int  assist_tools;        // bool: host-defined assists/cheats are enabled
+
+    /* Optional host-consumed bindings. A GameInfo with settings_bindings=1
+     * exposes keyboard + standard-controller chips on the Controller page.
+     * Keyboard values are SDL scancodes; pad values use the encoding above. */
+    int player_key_bind[RECOMP_LAUNCHER_MAX_PLAYERS]
+                       [RECOMP_LAUNCHER_MAX_BINDINGS];
+    int player_pad_bind[RECOMP_LAUNCHER_MAX_PLAYERS]
+                       [RECOMP_LAUNCHER_MAX_BINDINGS];
+    int assist_key_bind[RECOMP_LAUNCHER_MAX_ASSIST_BINDINGS];
+    int assist_pad_bind[RECOMP_LAUNCHER_MAX_ASSIST_BINDINGS];
+
+    /* Local rewind snap-ring capacity (PSX). UI offers 50/100/150/200;
+     * 0 = unset -> model seeds 50. See RECOMP_LAUNCHER_HAS_REWIND_DEPTH. */
+    int  rewind_depth;
+    /* Frames between local rewind snaps. UI offers 1/4/8/12/15; 0 => 15. */
+    int  rewind_interval;
+
+    // ---- online identity (GameInfo.has_player_name games) -----------------
+    // Persistent host-owned display name (the DS firmware nickname on NDS);
+    // empty = the runtime's default. Edited on the dashboard IDENTITY card;
+    // the host validates on use and persists it like bios_path. Appended
+    // additively, same ABI convention as every block above.
+    char player_name[64];
+
+    /* GLSL .glsl/.glslp path selected from Display settings. Empty = disabled.
+     * Appended for ABI stability; see GameInfo.has_shader. */
+    char shader_path[512];
+
+    /* How a low-res FMV is reconstructed when it is scaled up to the window.
+     * Separate from texture_filter: that one is about the 3D rasterizer's
+     * texture sampling, this one is about a decoded video frame, and the right
+     * answer differs (a movie wants reconstruction, a PSX texture usually wants
+     * the native look). Only consulted while antialiasing is on.
+     *   0 = unset -> the model seeds RECOMP_LAUNCHER_FMV_FILTER_BICUBIC
+     *   1 nearest, 2 bilinear, 3 sharp-bilinear, 4 bicubic
+     * Stored 1-based so a zero-initialized host predating the field gets the
+     * default rather than silently pinning "nearest". See GameInfo.has_fmv_filter.
+     * Appended additively. */
+    int  fmv_filter;
+
+    /* Driver vsync at present time (GameInfo.has_vsync consoles).
+     *   RECOMP_LAUNCHER_VSYNC_ON (1)        tear-free, swap waits on the panel
+     *   RECOMP_LAUNCHER_VSYNC_OFF (2)       immediate swap, lowest display latency
+     *   RECOMP_LAUNCHER_VSYNC_ADAPTIVE (3)  vsync above the refresh, immediate below
+     * 0 = unset -> the model seeds ON. Deliberately NOT stored as the host's
+     * own 1/0/-1 encoding: 0 is a meaningful value there ("off"), which a
+     * zero-initialized host predating this field could not be told apart from
+     * "no opinion". Appended additively. */
+    int  vsync;
 };
+
+/* Values for RecompLauncherCSettings.vsync (1-based; 0 = unset). */
+#define RECOMP_LAUNCHER_VSYNC_ON       1
+#define RECOMP_LAUNCHER_VSYNC_OFF      2
+#define RECOMP_LAUNCHER_VSYNC_ADAPTIVE 3
+#define RECOMP_LAUNCHER_VSYNC_COUNT    3
+
+/* Values for RecompLauncherSettings.fmv_filter (1-based; 0 = unset). */
+#define RECOMP_LAUNCHER_FMV_FILTER_NEAREST  1
+#define RECOMP_LAUNCHER_FMV_FILTER_BILINEAR 2
+#define RECOMP_LAUNCHER_FMV_FILTER_SHARP    3
+#define RECOMP_LAUNCHER_FMV_FILTER_BICUBIC  4
+#define RECOMP_LAUNCHER_FMV_FILTER_COUNT    4
+/* Hosts can #ifdef on this to stay source-compatible with older recomp-ui. */
+#define RECOMP_LAUNCHER_HAS_FMV_FILTER 1
 
 // ---- host verification/inspection results (filled by the callbacks below) ----
 // Plain-C structs so a host can implement the callbacks with zero launcher
@@ -253,7 +698,28 @@ typedef struct RecompLauncherCDiscVerify {
     char region[8];    // e.g. "NTSC-U"; "" = unknown
     int  iso_ok;       // ISO9660 / system header present
     int  verdict;      // 0 none, 1 ok, 2 warn, 3 bad
+    /* Appended for ABI: TOC / netplay mount gate (memset 0 = legacy host). */
+    int  track_count;      // mounted iso_track_count; 0 if TOC not opened
+    int  netplay_ok;       // 1 = mount satisfies game.toml [netplay] policy
+    char disc_fp[65];      // lowercase hex SHA-256 TOC fingerprint; "" if none
+    char netplay_detail[160];
 } RecompLauncherCDiscVerify;
+
+/* Host BIOS check for the first-run setup wizard (has_bios games). */
+typedef struct RecompLauncherCBiosVerify {
+    int  ok;           // 1 = usable BIOS present (linked / ready to Play)
+    int  warn;         // 1 = size/CRC soft mismatch (still ok to boot)
+    char detail[160];  // short status for the UI
+    /* 1 = file looks valid but is not compiled into this binary â€” player must
+     * Generate & rebuild (or switch back to a linked BIOS like OpenBIOS).
+     * Appended for ABI compatibility; older hosts leave it 0 via memset. */
+    int  needs_regen;
+} RecompLauncherCBiosVerify;
+
+/* Optional progress callback for prepare_with_progress (worker thread).
+ * pct is 0..1 when known; negative means indeterminate. message may be NULL. */
+typedef void (*RecompLauncherCPrepareProgressFn)(void* ctx, float pct,
+                                                 const char* message);
 
 typedef struct RecompLauncherCMemcard {
     int           valid;          // 128 KB + "MC" magic present
@@ -262,9 +728,9 @@ typedef struct RecompLauncherCMemcard {
 } RecompLauncherCMemcard;
 
 // One Transfer Pak slot's inspection result (filled by the tpak_inspect
-// callback below). The HOST owns all cartridge knowledge — header sniffing,
+// callback below). The HOST owns all cartridge knowledge â€” header sniffing,
 // which Gen-1 charmap decodes the trainer name (ASCII for Stadium US, kana
-// for Pocket Monsters Stadium J), what the cart is called on screen — so the
+// for Pocket Monsters Stadium J), what the cart is called on screen â€” so the
 // launcher stays console-generic and just renders these facts.
 typedef struct RecompLauncherCTpak {
     int  valid;             // recognized GB cartridge
@@ -283,7 +749,7 @@ typedef struct RecompLauncherCGameInfo {
     int            has_expected_crc;
     const uint8_t (*known_sha256)[32];
     size_t         num_known_sha256;
-    /* Accepted SHA-1 fingerprints as 40-char lowercase hex strings — the
+    /* Accepted SHA-1 fingerprints as 40-char lowercase hex strings â€” the
      * identity cartridge consoles (GBA, SNES) actually gate on. The launcher
      * computes SHA-1 over the picked ROM and matches any entry, so its
      * "verified" check agrees with the game runtime's real gate. NULL/0 =>
@@ -294,7 +760,7 @@ typedef struct RecompLauncherCGameInfo {
     int            widescreen_supported;   /* hide Widescreen settings when 0 */
     /* How many players the GAME supports (1..RECOMP_LAUNCHER_MAX_PLAYERS),
      * additionally capped by the active console profile. The launcher hides
-     * Player N+ rows when this is N — e.g. SMW Co-op is 2-player even though
+     * Player N+ rows when this is N â€” e.g. SMW Co-op is 2-player even though
      * the shared ABI can store 5. 0 means "unset" and is treated as 2 for
      * backward compatibility with callers that predate this field. */
     int            num_players;
@@ -315,7 +781,7 @@ typedef struct RecompLauncherCGameInfo {
      * default (recompui_keybinds_init(NULL) / psx_keybinds_init(NULL)) so the
      * launcher and the game agree on one file without a host having to set
      * this. The ON-DISK FORMAT is chosen automatically from the active
-     * SystemProfile (launcher_system.h) — not from a separate flag here:
+     * SystemProfile (launcher_system.h) â€” not from a separate flag here:
      * PSX games get psxrecomp's own psx_keybinds.c format (24 keys, section
      * [player1]/[player2], names up/down/.../rs_right) so rebinds actually
      * reach the game; every other console keeps this launcher's generic
@@ -329,7 +795,6 @@ typedef struct RecompLauncherCGameInfo {
     // analog/digital art are never shown (the generic pad.tga is used).
     int            pad_mode_supported;    // 0 = no pad-mode UI at all; 1 = show the selector + swapping art
     int            pad_mode_selectable;   // 0 = hide selector, force locked_pad_mode (game.lock_mode)
-    int            allow_hybrid;          // 0 = hide the Hybrid option
     int            locked_pad_mode;       // forced mode when !pad_mode_selectable
     int            lock_device;           // 1 = hide the player controller cards entirely (fixed pad)
     // Aspect ratios offered. bit0 = 4:3 (implied/always), bit1 = 16:9, bit2 = 21:9.
@@ -354,7 +819,7 @@ typedef struct RecompLauncherCGameInfo {
                                 // Kept only for ABI layout compatibility.
     int  has_bios;              // BIOS path picker
     int  has_deadzone_pct;      // single analog-deadzone % control
-    const char* rom_noun;       // "ROM" (default/NULL) | "Disc" | "Cartridge" — the Change-<noun>
+    const char* rom_noun;       // "ROM" (default/NULL) | "Disc" | "Cartridge" â€” the Change-<noun>
                                  // button label + File row
     // Languages (Localization menu shown only when num_languages > 0).
     const char* const* language_labels;  // e.g. {"English","Japanese"}
@@ -399,7 +864,7 @@ typedef struct RecompLauncherCGameInfo {
 
     /* ---- renderer vocabulary override ------------------------------------
      * When set, the has_renderer cycle walks these 0..num_renderers-1 labels
-     * instead of the built-in Software/OpenGL pair — e.g. the RT64 hosts'
+     * instead of the built-in Software/OpenGL pair â€” e.g. the RT64 hosts'
      * {"Auto","Vulkan","D3D12"} graphics-API pick. Settings.renderer holds
      * the committed index. NULL/0 => the legacy 2-value toggle. */
     const char* const* renderer_labels;
@@ -409,7 +874,7 @@ typedef struct RecompLauncherCGameInfo {
      * tpak_slots (0..4): how many controller ports offer a Transfer Pak GB
      * cartridge card. 0 => the panel never composes (Snap, Pikachu). Stadium
      * passes 4. The launcher edits Settings.tpak_* (ROM/save paths + enabled)
-     * and calls tpak_inspect — the HOST's cartridge brain — on every change
+     * and calls tpak_inspect â€” the HOST's cartridge brain â€” on every change
      * to refresh the card's label/trainer/tint facts. tpak_inspect may be
      * NULL: cards then show file names with the neutral tint. */
     int  tpak_slots;
@@ -436,7 +901,7 @@ typedef struct RecompLauncherCGameInfo {
     int  has_integer_scale;   // Integer-scale checkbox in Display settings
     // HD texture packs (Mesen hires.txt format): 1 shows the HD-pack toggle +
     // folder picker in Display settings (NES defaults this ON per game; a
-    // stock build that must not load packs passes 0 — e.g. unpatched Zelda).
+    // stock build that must not load packs passes 0 â€” e.g. unpatched Zelda).
     int  hdpack_supported;
     // Password/mantra save (e.g. Faxanadu): when password_save_path is
     // non-NULL the SAVES row shows the password text (read-only, editable
@@ -444,16 +909,28 @@ typedef struct RecompLauncherCGameInfo {
     // The file is a single line of text. Independent of sram_path.
     const char* password_save_path;   // abs path to the 1-line password file
     const char* password_save_label;  // row label, e.g. "Password" / "Mantra"
+    // Binary SRAM-backed password record. When password_sram_path is non-NULL
+    // the same SAVES row reads/edits a MMXPASS v1 record inside the SRAM file.
+    // password_sram_size is the minimum file size to create/maintain.
+    const char* password_sram_path;
+    const char* password_sram_label;
+    int         password_sram_size;
+    int         password_sram_offset;
     // Light-gun (NES Zapper) game: the controller config page shows a Zapper
     // block (mouse-as-gun + crosshair toggles, persisted to the engine's
     // keybinds.ini [zapper] section) alongside the pad UI.
     int  zapper;
 
+    // Cartridge light sensor: 1 adds a Solar sensor panel to Settings, where
+    // the player sets the location its brightness is read from. Games without
+    // the hardware pass 0 and the panel never composes, so every existing
+    // consumer is byte-for-byte unchanged.
+    int  has_solar_sensor;
+
     // Live aspect-driven view capability. When present, Display settings show
     // an Adaptive view toggle. Adaptive + fullscreen leaves the fixed aspect
     // control visible but disabled because the display chooses the live width.
     int  adaptive_view_supported;
-
     // Netplay is a title/developer capability, not a user setting. When set,
     // the dashboard exposes lobby host/join controls through host-owned
     // callbacks.
@@ -464,17 +941,254 @@ typedef struct RecompLauncherCGameInfo {
      * LAN room header (NULL/empty => online Lobby Server URL). */
     int resume_netplay_room;
     const char* resume_netplay_endpoint;
+
+    /* ---- first-run setup wizard -------------------------------------------
+     * Opt-in product surface. When setup_wizard_supported is 0 (default), the
+     * launcher never opens the first-run modal and never shows Generate /
+     * rebuild â€” even if prepare_* callbacks are non-NULL. Hosts that ship a
+     * self-build flow set this to 1 and fill prepare/rebuild/toolchain fields.
+     *
+     * When supported AND (needs_setup is 1 OR the launcher detects a missing
+     * ROM/disc, and missing BIOS when has_bios), a blocking setup modal opens
+     * before the dashboard. Cart-only games (has_bios=0) only prompt for a ROM.
+     *
+     * bios_verify (optional): host checks BIOS size/CRC. Return 1 and fill
+     * `out` (ok/warn/detail). Called with an empty path when the player has
+     * not chosen a dump â€” host should accept that when a bundled BIOS
+     * (e.g. OpenBIOS) is available, or set ok=0 when a retail dump is
+     * required. NULL => empty path = bundled OK; non-empty path must exist.
+     *
+     * prepare_disc (optional): convert a raw dump into a playable image.
+     * Blocking host callback; the UI shows a busy state while it runs.
+     * Return 1 and write the playable .cue/.bin/.img/.iso/.car path into out_disc_path.
+     * prepare_disc_label / prepare_disc_note are button + help text (NULL =>
+     * "Convert raw dumpâ€¦" / default note).
+     *
+     * Path persistence (Continue to launcher / Change ROM / BIOS browse):
+     * The launcher writes `rom_cache_path` (NULL => "rom.cfg") immediately so
+     * quitting without PLAY still remembers the ROM. Optional persist_setup
+     * lets the host also flush BIOS / config.ini (return 0 on success). */
+    int needs_setup;
+    int (*bios_verify)(const char* bios_path, RecompLauncherCBiosVerify* out);
+    int (*prepare_disc)(const char* source_path, char* out_disc_path, size_t out_cap,
+                        char* err_msg, size_t err_cap);
+    const char* prepare_disc_label;
+    const char* prepare_disc_note;
+    const char* rom_cache_path; /* NULL => "rom.cfg" next to cwd/exe */
+    int (*persist_setup)(void* ctx, const char* rom_path, const char* bios_path);
+    void* persist_setup_ctx;
+
+    /* Optional schema-driven mod provider. Appended for ABI stability. The
+     * Mods view requires both RECOMP_UI_ENABLE_MODS=1 and a non-NULL provider;
+     * default builds therefore remain inert even if a caller populates this
+     * field. Features are the primary user-facing surface; packages are the
+     * secondary installation/maintenance surface. */
+    const RecompLauncherCModProvider* mods;
+
+    /* ---- controller motion ----------------------------------------------
+     * 1 adds a MOTION card to the Controller configuration page with a gyro
+     * sensitivity slider. The launcher only edits Settings.gyro_sensitivity;
+     * discovery, sensor selection, and axis mapping remain host-owned. */
+    int has_gyro_controls;
+
+    /* Add independent checkboxes to Display settings. The host maps their
+     * committed Settings values onto renderer configuration. */
+    int has_sharp_filter;
+    int has_affine_filter;
+
+    /* ---- multi-display layout -------------------------------------------
+     * Optional host-defined Display row. Settings.display_layout cycles over
+     * these labels. Nintendo DS uses {"Stacked window","Separate windows"}.
+     * NULL/0 keeps every existing single-display launcher unchanged. */
+    const char* const* display_layout_labels;
+    int num_display_layouts;
+
+    /* ---- prepare job UX (appended; disc convert / local codegen) ---------
+     * prepare_use_selected_rom: 1 = the prepare button uses the already-
+     * picked ROM/disc (no second file picker). Cart codegen hosts use this.
+     * prepare_section_title / prepare_busy_status / prepare_success_status
+     * override the default "Convert raw dumpâ€¦" copy when non-NULL.
+     *
+     * prepare_with_progress: when non-NULL, preferred over prepare_disc.
+     * Same success contract (return 1 + out_path); may invoke on_progress
+     * from the worker thread. Zero-init leaves legacy prepare_disc behavior. */
+    int prepare_use_selected_rom;
+    const char* prepare_section_title;
+    const char* prepare_busy_status;
+    const char* prepare_success_status;
+    int (*prepare_with_progress)(const char* source_path,
+                                 char* out_path, size_t out_cap,
+                                 char* err_msg, size_t err_cap,
+                                 RecompLauncherCPrepareProgressFn on_progress,
+                                 void* progress_ctx);
+
+    /* ---- rebuild + relaunch after prepare (local codegen hosts) ----------
+     * rebuild_with_progress: compile the project after sources are generated.
+     * Return 1 and write the new/updated executable path into out_exe_path.
+     * rebuild_after_prepare: when 1 and rebuild_with_progress is set, the
+     * setup wizard auto-starts rebuild after a successful prepare.
+     * relaunch_after_rebuild: when 1, a successful rebuild makes
+     * recomp_launcher_run_window return RECOMP_LAUNCHER_RESULT_RELAUNCH (3);
+     * call recomp_launcher_relaunch_exe() for the path to exec. */
+    int (*rebuild_with_progress)(const char* rom_path,
+                                 char* out_exe_path, size_t out_cap,
+                                 char* err_msg, size_t err_cap,
+                                 RecompLauncherCPrepareProgressFn on_progress,
+                                 void* progress_ctx);
+    int rebuild_after_prepare;
+    int relaunch_after_rebuild;
+    const char* rebuild_busy_status;     /* NULL => "Building gameâ€¦" */
+    const char* rebuild_success_status;  /* NULL => "Build complete." */
+
+    /* ---- optional PGO optimize (MotK FMV; skip generate / setup wizard) ---
+     * pgo_optimize_with_progress: instrument â†’ train (video) â†’ PGO use rebuild
+     * on existing generated C. Same success/relaunch contract as rebuild. */
+    int (*pgo_optimize_with_progress)(const char* rom_path,
+                                      char* out_exe_path, size_t out_cap,
+                                      char* err_msg, size_t err_cap,
+                                      RecompLauncherCPrepareProgressFn on_progress,
+                                      void* progress_ctx);
+    const char* pgo_busy_status;         /* NULL => "Optimizing FMVâ€¦" */
+    const char* pgo_success_status;      /* NULL => "FMV optimize complete." */
+
+    /* ---- optional FMV timing opt (MotK VLC load-charge batch; regen+rebuild)
+     * Unlike PGO, this regenerates C from game.toml then rebuilds (no train). */
+    int (*fmv_timing_optimize_with_progress)(const char* rom_path,
+                                             char* out_exe_path, size_t out_cap,
+                                             char* err_msg, size_t err_cap,
+                                             RecompLauncherCPrepareProgressFn on_progress,
+                                             void* progress_ctx);
+    const char* fmv_timing_busy_status;     /* NULL => "Applying FMV timingâ€¦" */
+    const char* fmv_timing_success_status;  /* NULL => "FMV timing applied." */
+
+    /* When 1, the setup modal hides "Continue to launcher" and requires
+     * prepare (and rebuild when rebuild_after_prepare is set). Local codegen
+     * first-run: Generate & rebuild, then relaunch â€” Quit is the only other exit.
+     * When 0 but prepare_* is still wired (sources already generated), the
+     * wizard opens only for a cleared BIOS/disc pick and shows a media-confirm
+     * prompt instead of the full Generate & rebuild first-run page. */
+    int prepare_required_before_continue;
+
+    /* ---- portable toolchain step (appended; local codegen hosts) ----------
+     * When setup_needs_toolchain is 1, the first-run wizard shows a page to
+     * download cmake-clang-v1 or pick an offline zip before BIOS/ROM/generate.
+     * toolchain_is_ready: optional quick check (usable local cmake/clang).
+     * ensure_toolchain_with_progress: download==0 zip/cache only; 1 = download
+     * if missing; 2 = force GitHub /releases/latest (update). Empty zip_path
+     * with download==0 resolves cache only. See toolchain_update_available
+     * (appended below) for remote newer-than-local prompts. */
+    int setup_needs_toolchain;
+    int (*toolchain_is_ready)(void);
+    int (*ensure_toolchain_with_progress)(
+        int download, const char* zip_path, char* err_msg, size_t err_cap,
+        RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx);
+    /* PSX geometry-precision controls (Settings.geometry_correction /
+     * perspective_texturing). 0 => no row drawn, so every console that leaves
+     * this unset keeps exactly today's settings surface. One flag still gates
+     * both settings because they are two halves of the same enhancement, but
+     * only perspective_texturing currently draws a control: geometry_correction
+     * is known to crack meshes at the coverage the runtime can achieve and is
+     * withdrawn from the UI while staying readable from game.toml/settings.toml
+     * (psxrecomp ENHANCEMENTS.md G1.8/G1.9). Appended for ABI stability. */
+    int  has_geometry_precision;
+
+    /* Local rewind buffer size control (Settings.rewind_depth). PSX only. */
+    int  has_rewind_depth;
+
+    /* Driver-vsync control (Settings.vsync). 0 => no row drawn, so a console
+     * that leaves this unset keeps exactly today's settings surface. Appended
+     * for ABI stability. */
+    int  has_vsync;
+
+    /* Master switch for the first-run setup wizard + Generate & rebuild UI.
+     * Appended for ABI stability; zero-init keeps every existing host dark. */
+    int  setup_wizard_supported;
+
+    /* Optional: return 1 when the installed cmake-clang-v1 pack is older than
+     * GitHub /releases/latest (fills local/remote version strings). Wizard
+     * keeps page 0 open to prompt Update / Skip. NULL => no update checks.
+     * Appended for ABI stability. */
+    int (*toolchain_update_available)(char* local_ver, size_t local_cap,
+                                      char* remote_ver, size_t remote_cap);
+
+    /* Optional: after toolchain_is_ready returns 0, a short note when the host
+     * removed a broken cache (failed clang/lld smoke test). NULL/empty => none.
+     * Appended for ABI stability. */
+    const char* (*toolchain_repair_note)(void);
+
+    /* Optional copy for a host-defined aspect cycle. When NULL, the row keeps
+     * the historical "View mode" label and has no explanatory tooltip. These
+     * are appended so older zero-initialized hosts retain their exact UI. */
+    const char* aspect_setting_label;
+    const char* aspect_setting_help;
+
+    /* Optional complete host-owned defaults snapshot. When non-NULL, the
+     * Settings footer exposes a confirmed "Restore Defaults" action that
+     * copies this value into the launcher's editable settings. The launcher
+     * copies the snapshot during initialization. ROM and save files are not
+     * part of this structure and are never deleted. */
+    const RecompLauncherCSettings* default_settings;
+
+    /* Optional top-level launcher sections. `has_assist_tools` exposes a
+     * dedicated opt-in page backed by Settings.assist_tools. `credits_text`
+     * exposes a read-only Credits page and remains host-owned UTF-8 text. */
+    int  has_assist_tools;
+    const char* assist_tools_note;
+    const char* credits_text;
+    /* Host-owned binding mode. The active console profile supplies player
+     * button names; assist_binding_labels supplies the optional global action
+     * names (for example Rewind and Fast-forward). */
+    int settings_bindings;
+    const char* const* assist_binding_labels;
+    int assist_binding_count;
+
+    /* ---- online identity (opt-in, appended additively) ------------------
+     * has_player_name: the game supports an online display name (a console
+     * nickname the runtime applies at launch). Renders the dashboard
+     * IDENTITY card for profiles whose panels_dashboard lists "identity" --
+     * composition + availability, both layers, like has_bios. Most titles
+     * have no online play and never set this (owner directive: shared
+     * launcher features are per-game opt-in).
+     * identity_detail: optional host-owned read-only line shown under the
+     * name field (e.g. "Console MAC: 00:09:BF:xx:xx:xx"). NULL hides it. */
+    int has_player_name;
+    const char* identity_detail;
+
+    /* Display row for Settings.shader_path. Appended for ABI stability. */
+    int has_shader;
+
+    /* Display row for Settings.fmv_filter. Only meaningful for a console whose
+     * runtime decodes full-motion video into a low-res buffer it then scales
+     * (PSX and friends); everything else leaves this 0 and the row is absent.
+     * Appended for ABI stability. */
+    int has_fmv_filter;
 } RecompLauncherCGameInfo;
+
+/* recomp_launcher_run_window return codes */
+#define RECOMP_LAUNCHER_RESULT_LAUNCH       0
+#define RECOMP_LAUNCHER_RESULT_QUIT         1
+#define RECOMP_LAUNCHER_RESULT_UNAVAILABLE  2
+#define RECOMP_LAUNCHER_RESULT_RELAUNCH     3
 
 // Returns: 0 = LAUNCH (boot out_rom_path with the edited *io),
 //          1 = QUIT (caller should exit),
-//          2 = UNAVAILABLE (assets/GL failed — caller boots as if skipped).
+//          2 = UNAVAILABLE (assets/GL failed â€” caller boots as if skipped),
+//          3 = RELAUNCH (host should exec recomp_launcher_relaunch_exe()).
 int recomp_launcher_run_window(const char* window_title,
                              RecompLauncherCSettings* io,
                              const RecompLauncherCGameInfo* game,
                              const char* assets_dir,
                              const char* initial_rom,
                              char* out_rom_path, size_t out_rom_path_len);
+
+/* Valid after run_window returns RECOMP_LAUNCHER_RESULT_RELAUNCH. Copies the
+ * executable path produced by rebuild_with_progress. Returns 1 on success. */
+int recomp_launcher_relaunch_exe(char* out, size_t out_cap);
+
+/* When preserve != 0, the launcher tears down its window/GL context but does
+ * NOT call SDL_Quit(), so an in-process host can keep SDL subsystems across
+ * launcher â†’ game (and rematch soft-return). Default is 0 (full Quit). */
+void recomp_launcher_set_preserve_sdl(int preserve);
 
 #ifdef __cplusplus
 }

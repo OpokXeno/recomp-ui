@@ -11,6 +11,7 @@
 //       breakpoint switches the dashboard between two columns and one column.
 
 #include "launcher_backend.h"
+#include "launcher_boot_timing.h"
 #include "launcher_gl.h"
 #include "launcher_input.h"
 #include "launcher_files.h"
@@ -64,11 +65,96 @@
   #endif
 #endif
 
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <unordered_map>
+#include <vector>
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+
+extern "C" {
+void launcher_model_toggle_frame_interp(LauncherModel* m);
+void launcher_model_cycle_interp_fps(LauncherModel* m);
+const char* launcher_model_interp_fps_label(const LauncherModel* m);
+}
 
 extern "C" const char* launcher_backend_name(void) { return "Dear ImGui"; }
+
+struct ShaderPresetEntry {
+    std::string label;
+    std::string path;
+};
+
+static std::vector<ShaderPresetEntry> g_shader_presets;
+
+static bool shader_path_has_supported_ext(const std::filesystem::path& p) {
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return ext == ".glsl" || ext == ".glslp";
+}
+
+static std::string shader_label_from_relative_path(std::filesystem::path rel) {
+    rel.replace_extension();
+    std::string label = rel.generic_string();
+    for (char& c : label)
+        if (c == '/' || c == '_' || c == '-') c = ' ';
+    bool cap = true;
+    for (char& c : label) {
+        if (std::isspace((unsigned char)c)) {
+            cap = true;
+        } else if (cap) {
+            c = (char)std::toupper((unsigned char)c);
+            cap = false;
+        }
+    }
+    return label;
+}
+
+static bool shader_relative_path_is_private(const std::filesystem::path& rel) {
+    for (const std::filesystem::path& part : rel) {
+        std::string s = part.string();
+        if (!s.empty() && (s[0] == '_' || s[0] == '.'))
+            return true;
+    }
+    return false;
+}
+
+static void refresh_shader_presets() {
+    g_shader_presets.clear();
+    const std::filesystem::path root = std::filesystem::path("assets") / "shaders";
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec))
+        return;
+    for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec) || !shader_path_has_supported_ext(it->path()))
+            continue;
+        std::filesystem::path rel = std::filesystem::relative(it->path(), root, ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (shader_relative_path_is_private(rel))
+            continue;
+        g_shader_presets.push_back({
+            shader_label_from_relative_path(rel),
+            it->path().generic_string()
+        });
+    }
+    std::sort(g_shader_presets.begin(), g_shader_presets.end(),
+              [](const ShaderPresetEntry& a, const ShaderPresetEntry& b) {
+                  return a.label < b.label;
+              });
+}
 
 // `volatile` on purpose. Under a host build with -Os -ffunction-sections
 // -fdata-sections + -Wl,--gc-sections (gb-recompiled's generated projects),
@@ -110,6 +196,323 @@ int         g_pad_count = 0;
 
 char        g_pick_buf[512] = {};    // ROM picker result
 
+enum class BuiltinPickerKind { Rom, Bios, SetupToolchainZip };
+
+struct BuiltinRomPicker {
+    bool active = false;
+    bool from_setup = false;
+    bool focus_path = false;
+    BuiltinPickerKind kind = BuiltinPickerKind::Rom;
+    char title[96] = "Select game file";
+    char directory[1024] = {};
+    char selected[1024] = {};
+    char error[256] = {};
+    std::vector<std::string> patterns;
+    std::string description;
+};
+BuiltinRomPicker g_rom_picker;
+
+static std::string lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+static bool builtin_picker_matches(const std::filesystem::path& path) {
+    if (g_rom_picker.patterns.empty()) return true;
+    const std::string filename = lower_ascii(path.filename().string());
+    for (const std::string& raw : g_rom_picker.patterns) {
+        const std::string pattern = lower_ascii(raw);
+        if (pattern.empty() || pattern == "*" || pattern == "*.*") return true;
+        if (pattern.size() > 1 && pattern[0] == '*' &&
+            filename.size() >= pattern.size() - 1 &&
+            filename.compare(filename.size() - (pattern.size() - 1),
+                             pattern.size() - 1, pattern.substr(1)) == 0)
+            return true;
+        if (filename == pattern) return true;
+    }
+    return false;
+}
+
+static std::filesystem::path builtin_picker_initial_path(LauncherModel* m,
+                                                         BuiltinPickerKind kind) {
+    std::error_code ec;
+    if (kind == BuiltinPickerKind::Bios && m && m->s.bios_path[0]) {
+        std::filesystem::path current(m->s.bios_path);
+        if (std::filesystem::is_regular_file(current, ec)) return current;
+    }
+    if (kind == BuiltinPickerKind::SetupToolchainZip && m && m->setup_tc_zip[0]) {
+        std::filesystem::path current(m->setup_tc_zip);
+        if (std::filesystem::is_regular_file(current, ec)) return current;
+    }
+    if (kind == BuiltinPickerKind::Rom && m && m->rom_full[0]) {
+        std::filesystem::path current(m->rom_full);
+        if (std::filesystem::is_regular_file(current, ec)) return current;
+    }
+    if (kind == BuiltinPickerKind::Rom) {
+        if (const char* hint = std::getenv("RECOMP_DISC_HINT")) {
+            std::filesystem::path hinted(hint);
+            ec.clear();
+            if (std::filesystem::is_regular_file(hinted, ec)) return hinted;
+        }
+    }
+    if (const char* image = std::getenv("RECOMP_APPIMAGE_PATH")) {
+        std::filesystem::path appimage(image);
+        ec.clear();
+        if (std::filesystem::exists(appimage.parent_path(), ec))
+            return appimage.parent_path();
+    }
+    if (const char* home = std::getenv("HOME")) return std::filesystem::path(home);
+    return std::filesystem::current_path(ec);
+}
+
+static void open_builtin_file_picker(LauncherModel* m, BuiltinPickerKind kind,
+                                     const char* title,
+                                     const char* const* patterns, int pattern_count,
+                                     const char* description, bool from_setup) {
+    g_rom_picker = BuiltinRomPicker{};
+    g_rom_picker.active = true;
+    g_rom_picker.from_setup = from_setup;
+    g_rom_picker.kind = kind;
+    const char* fallback_title =
+        kind == BuiltinPickerKind::Bios             ? "Select BIOS file"
+        : kind == BuiltinPickerKind::SetupToolchainZip ? "Select toolchain zip"
+                                                    : "Select game file";
+    std::snprintf(g_rom_picker.title, sizeof(g_rom_picker.title), "%s",
+                  title && title[0] ? title : fallback_title);
+    for (int i = 0; patterns && i < pattern_count; ++i)
+        if (patterns[i]) g_rom_picker.patterns.emplace_back(patterns[i]);
+    if (description) g_rom_picker.description = description;
+
+    std::filesystem::path initial = builtin_picker_initial_path(m, kind);
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(initial, ec)) {
+        std::snprintf(g_rom_picker.selected, sizeof(g_rom_picker.selected), "%s",
+                      initial.string().c_str());
+        initial = initial.parent_path();
+    }
+    if (initial.empty() || !std::filesystem::is_directory(initial, ec))
+        initial = std::filesystem::current_path(ec);
+    std::snprintf(g_rom_picker.directory, sizeof(g_rom_picker.directory), "%s",
+                  initial.string().c_str());
+    g_rom_picker.focus_path = true;
+}
+
+/* Prefer native (zenity/kdialog on Linux, tinyfiledialogs elsewhere). Fall
+ * back to the in-app browser when native is unavailable or returns -1. */
+static bool prefer_builtin_file_picker(void) {
+    return false;
+}
+
+static void apply_builtin_picker_selection(LauncherModel* m, const char* path) {
+    if (!m || !path) return;
+    if (g_rom_picker.kind == BuiltinPickerKind::Bios) {
+        launcher_model_request_bios_path(m, path);
+    } else if (g_rom_picker.kind == BuiltinPickerKind::SetupToolchainZip) {
+        std::snprintf(m->setup_tc_zip, sizeof(m->setup_tc_zip), "%s", path);
+        m->setup_error[0] = '\0';
+    } else {
+        launcher_model_set_rom(m, path);
+    }
+}
+
+static void request_file_picker(LauncherModel* m, BuiltinPickerKind kind,
+                                const char* title, const char* const* patterns,
+                                int pattern_count, const char* description,
+                                bool from_setup) {
+    if (!prefer_builtin_file_picker() &&
+        launcher_native_file_picker_available()) {
+        const int r = launcher_try_pick_file(title, patterns, pattern_count,
+                                             description, g_pick_buf,
+                                             sizeof(g_pick_buf));
+        if (r == 1) {
+            g_rom_picker.kind = kind; /* apply_ uses kind */
+            apply_builtin_picker_selection(m, g_pick_buf);
+            return;
+        }
+        if (r == 0) return; /* user cancelled */
+        /* r == -1: fall through to built-in browser */
+    }
+    open_builtin_file_picker(m, kind, title, patterns, pattern_count,
+                             description, from_setup);
+}
+
+static void request_rom_picker(LauncherModel* m, const char* title,
+                               const char* const* patterns, int pattern_count,
+                               const char* description, bool from_setup) {
+    request_file_picker(m, BuiltinPickerKind::Rom, title, patterns,
+                        pattern_count, description, from_setup);
+}
+
+static void request_bios_picker(LauncherModel* m, const char* title,
+                                bool from_setup) {
+    static const char* kBiosPatterns[] = {"*.bin", "*.rom"};
+    request_file_picker(m, BuiltinPickerKind::Bios, title, kBiosPatterns, 2,
+                        "BIOS image (.bin .rom)", from_setup);
+}
+
+static void draw_builtin_rom_picker_contents(LauncherModel* m,
+                                             const LauncherTheme& th,
+                                             bool standalone_popup) {
+    namespace fs = std::filesystem;
+    ImGui::TextColored(col(th.accent), "%s", g_rom_picker.title);
+    ImGui::TextColored(col(th.text_muted),
+                       "Built-in browser (no desktop file-picker service required)");
+    if (!g_rom_picker.description.empty())
+        ImGui::TextColored(col(th.text_muted), "Showing: %s",
+                           g_rom_picker.description.c_str());
+    ImGui::Dummy(ImVec2(0, px(6)));
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Folder");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(px(500));
+    bool enter_dir = ImGui::InputText("##builtin_picker_directory",
+                                      g_rom_picker.directory,
+                                      sizeof(g_rom_picker.directory),
+                                      ImGuiInputTextFlags_EnterReturnsTrue);
+    if (enter_dir) {
+        std::error_code ec;
+        if (!fs::is_directory(fs::path(g_rom_picker.directory), ec))
+            std::snprintf(g_rom_picker.error, sizeof(g_rom_picker.error),
+                          "That folder does not exist or cannot be opened.");
+        else
+            g_rom_picker.error[0] = '\0';
+    }
+
+    if (ImGui::Button("Up", ImVec2(px(82), px(30)))) {
+        fs::path parent = fs::path(g_rom_picker.directory).parent_path();
+        if (!parent.empty()) {
+            std::snprintf(g_rom_picker.directory, sizeof(g_rom_picker.directory),
+                          "%s", parent.string().c_str());
+            g_rom_picker.selected[0] = '\0';
+            g_rom_picker.error[0] = '\0';
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Home", ImVec2(px(82), px(30)))) {
+        if (const char* home = std::getenv("HOME")) {
+            std::snprintf(g_rom_picker.directory, sizeof(g_rom_picker.directory),
+                          "%s", home);
+            g_rom_picker.selected[0] = '\0';
+            g_rom_picker.error[0] = '\0';
+        }
+    }
+
+    struct PickerEntry {
+        fs::path path;
+        bool directory;
+    };
+    std::vector<PickerEntry> entries;
+    std::error_code ec;
+    const fs::path directory(g_rom_picker.directory);
+    fs::directory_iterator it(directory, fs::directory_options::skip_permission_denied, ec);
+    if (!ec) {
+        for (const fs::directory_entry& entry : it) {
+            std::error_code type_ec;
+            const bool is_dir = entry.is_directory(type_ec);
+            if (type_ec) continue;
+            if (is_dir || builtin_picker_matches(entry.path()))
+                entries.push_back({entry.path(), is_dir});
+        }
+        std::sort(entries.begin(), entries.end(),
+                  [](const PickerEntry& a, const PickerEntry& b) {
+                      if (a.directory != b.directory) return a.directory > b.directory;
+                      return lower_ascii(a.path.filename().string()) <
+                             lower_ascii(b.path.filename().string());
+                  });
+    } else if (!g_rom_picker.error[0]) {
+        std::snprintf(g_rom_picker.error, sizeof(g_rom_picker.error),
+                      "Unable to open this folder.");
+    }
+
+    ImGui::BeginChild("##builtin_picker_entries", ImVec2(0, px(300)),
+                      ImGuiChildFlags_Borders);
+    for (const PickerEntry& entry : entries) {
+        const std::string name = entry.path.filename().string();
+        std::string label = entry.directory ? "[Folder] " + name : name;
+        label += "##" + entry.path.string();
+        const bool selected =
+            !entry.directory && entry.path.string() == g_rom_picker.selected;
+        if (ImGui::Selectable(label.c_str(), selected,
+                              ImGuiSelectableFlags_AllowDoubleClick)) {
+            if (entry.directory) {
+                std::snprintf(g_rom_picker.directory,
+                              sizeof(g_rom_picker.directory), "%s",
+                              entry.path.string().c_str());
+                g_rom_picker.selected[0] = '\0';
+                g_rom_picker.error[0] = '\0';
+            } else {
+                std::snprintf(g_rom_picker.selected,
+                              sizeof(g_rom_picker.selected), "%s",
+                              entry.path.string().c_str());
+                g_rom_picker.error[0] = '\0';
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("File");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1);
+    if (g_rom_picker.focus_path) {
+        ImGui::SetKeyboardFocusHere();
+        g_rom_picker.focus_path = false;
+    }
+    ImGui::InputText("##builtin_picker_selected", g_rom_picker.selected,
+                     sizeof(g_rom_picker.selected));
+    if (g_rom_picker.error[0])
+        ImGui::TextColored(col(th.warn), "%s", g_rom_picker.error);
+
+    ImGui::Dummy(ImVec2(0, px(6)));
+    if (ImGui::Button("Use selected file", ImVec2(px(180), px(34)))) {
+        std::error_code file_ec;
+        fs::path selected(g_rom_picker.selected);
+        if (fs::is_regular_file(selected, file_ec) &&
+            builtin_picker_matches(selected)) {
+            apply_builtin_picker_selection(m, selected.string().c_str());
+            g_rom_picker.active = false;
+            if (standalone_popup) ImGui::CloseCurrentPopup();
+        } else {
+            const char* err =
+                g_rom_picker.kind == BuiltinPickerKind::Bios
+                    ? "Select an existing BIOS image (.bin / .rom)."
+                : g_rom_picker.kind == BuiltinPickerKind::SetupToolchainZip
+                    ? "Select an existing toolchain .zip archive."
+                    : "Select an existing file matching this game's file types.";
+            std::snprintf(g_rom_picker.error, sizeof(g_rom_picker.error), "%s",
+                          err);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(px(110), px(34)))) {
+        g_rom_picker.active = false;
+        if (standalone_popup) ImGui::CloseCurrentPopup();
+    }
+}
+
+static void draw_standalone_builtin_rom_picker(LauncherModel* m,
+                                                const LauncherTheme& th) {
+    if (!g_rom_picker.active || g_rom_picker.from_setup) return;
+    const char* popup =
+        g_rom_picker.kind == BuiltinPickerKind::Bios
+            ? "Select BIOS file##builtin"
+        : g_rom_picker.kind == BuiltinPickerKind::SetupToolchainZip
+            ? "Select toolchain zip##builtin"
+            : "Select game file##builtin";
+    ImGui::OpenPopup(popup);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(px(720), 0), ImGuiCond_Always);
+    if (ImGui::BeginPopupModal(popup, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize |
+                               ImGuiWindowFlags_NoMove)) {
+        draw_builtin_rom_picker_contents(m, th, true);
+        ImGui::EndPopup();
+    }
+}
+
 // Context flag the dashboard composer sets just before invoking the "game"
 // panel's registered draw() — the LauncherPanelDrawFn signature (Model*,
 // const Theme*) has no room for the layout-context fill_h flag that
@@ -117,9 +520,9 @@ char        g_pick_buf[512] = {};    // ROM picker result
 // dashboard vs hug its content in the narrow stacked layout). Same pattern as
 // the other per-frame context globals below (g_th, g_pads).
 bool g_game_fill_h = false;
-// Same idea for the SAVE (memory-card) panel: the wide PSX dashboard sets this
-// so the memory-card card fills the right column down to the boxart column's
-// height (bottom-flush), while the narrow/stacked layout leaves it hugging.
+// SAVE (memory-card) fill-height: multitap (3+) only — cards stretch in a
+// reserved band under a scrolling controller stack. 2P hugs content; edge
+// inset comes from Child WindowPadding (same top/bottom as other panels).
 bool g_save_fill_h = false;
 
 // ---- panel registry lookup helper ------------------------------------------
@@ -222,6 +625,10 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
     style.WindowPadding  = ImVec2(th.spacing_lg, th.spacing_lg);
     style.FramePadding   = ImVec2(th.spacing_md, th.spacing_sm);
     style.ItemSpacing    = ImVec2(th.spacing_md, th.spacing_sm);
+#if defined(__ANDROID__)
+    style.TouchExtraPadding = ImVec2(5.0f, 5.0f);
+    style.ScrollbarSize = 24.0f;
+#endif
     style.ChildBorderSize = 1.0f;
     style.FrameBorderSize = 1.0f;   // controls get a visible outline
     style.Colors[ImGuiCol_WindowBg]        = col(th.background);
@@ -240,6 +647,9 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
     style.Colors[ImGuiCol_CheckMark]       = col(th.accent);
     style.Colors[ImGuiCol_Text]            = col(th.text);
     style.Colors[ImGuiCol_TextDisabled]    = col(th.text_muted);
+#if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 19100
+    style.Colors[ImGuiCol_TextLink]        = col(th.accent2);
+#endif
     style.Colors[ImGuiCol_Separator]       = col(th.border);
     style.Colors[ImGuiCol_ScrollbarBg]     = col(th.panel);
     style.Colors[ImGuiCol_ScrollbarGrab]   = col(th.border);
@@ -330,15 +740,16 @@ void draw_dot(bool on, const LngColor& good, const LngColor& off) {
 }
 // The primary neon CTA (PLAY): glow + violet gradient + play triangle. Fully
 // custom-drawn over an InvisibleButton so it looks nothing like a stock button.
-bool neon_cta(const char* id, const char* label, ImVec2 size) {
+bool neon_cta(const char* id, const char* label, ImVec2 size, bool enabled = true) {
     const LauncherTheme& th = *g_th;
     ImVec2 p = ImGui::GetCursorScreenPos();
     // EnableNav is REQUIRED: ImGui::InvisibleButton() adds ImGuiItemFlags_NoNav by
     // default, which silently excludes the CTA from gamepad/keyboard nav — that was
     // why PLAY could never be focused at runtime (only via boot SetItemDefaultFocus)
     // while normal widgets (Skip, Settings) always could.
+    if (!enabled) ImGui::BeginDisabled();
     bool clk = ImGui::InvisibleButton(id, size, ImGuiButtonFlags_EnableNav);
-    bool hov = ImGui::IsItemHovered();
+    bool hov = enabled && ImGui::IsItemHovered();
     bool act = ImGui::IsItemActive();
     bool foc = ImGui::IsItemFocused();   // gamepad/keyboard nav focus
     ImVec2 mn = p, mx = ImVec2(p.x + size.x, p.y + size.y);
@@ -367,7 +778,8 @@ bool neon_cta(const char* id, const char* label, ImVec2 size) {
     dl->AddTriangleFilled(ImVec2(cx, cy - tri*0.55f), ImVec2(cx, cy + tri*0.55f),
                           ImVec2(cx + tri, cy), fg);
     dl->AddText(ImVec2(cx + tri + gap, cy - th_h*0.5f), fg, label);
-    return clk;
+    if (!enabled) ImGui::EndDisabled();
+    return clk && enabled;
 }
 
 // Uppercase section eyebrow with letter-spacing + a short accent tick, e.g.
@@ -503,27 +915,6 @@ void stepper(const char* id, int value, const char* suffix, int* out_delta) {
     ImGui::PopID();
 }
 
-// ±1 stepper for the Genesis widescreen "extra cells per side" control. Unlike
-// the ±5 `stepper` above it reads its display string from the model
-// (launcher_model_ws_cells_label => "8 cells") so the clamp/format live in one
-// place, and it steps by a single cell.
-void ws_cells_stepper(const char* id, LauncherModel* m, int* out_delta) {
-    ImGui::PushID(id);
-    const float bh = px(30), fw = px(72);
-    if (ImGui::Button("-", ImVec2(px(32), bh))) *out_delta = -1;
-    ImGui::SameLine(0, px(6));
-    const char* buf = launcher_model_ws_cells_label(m);
-    float cx = ImGui::GetCursorPosX();
-    ImVec2 ts = ImGui::CalcTextSize(buf);
-    ImGui::SetCursorPosX(cx + (fw - ts.x) * 0.5f);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(buf);
-    ImGui::SameLine(0, 0);
-    ImGui::SetCursorPosX(cx + fw + px(6));
-    if (ImGui::Button("+", ImVec2(px(32), bh))) *out_delta = +1;
-    ImGui::PopID();
-}
-
 // "Label ......... [control]" row: label baseline-aligned to the control.
 // col_w > 0 reserves a FIXED label column so the control starts at the same x
 // on every row — the caller passes the widest label's width (+gap) to line all
@@ -631,20 +1022,25 @@ const LauncherTexture& verdict_texture(int verdict) {
 // placeholder verdict otherwise).
 void draw_verdict_block(const LauncherModel* m, const LauncherTheme& th, float availw) {
     const VerifyResult& v = m->verify;
+    // Keep the Serial/Region/ISO checklist mounted even before a disc is
+    // picked (setup wizard) so AutoResize modals don't jump when verify runs.
+    const bool pending = !m->rom_present;
     const char* headline =
-        v.verdict == 1 ? "Disc verified" :
-        v.verdict == 2 ? "Disc verified (warnings)" :
-        v.verdict == 3 ? "Disc verification failed" :
-                          "Disc not recognized";
+        pending          ? "No disc selected" :
+        v.verdict == 1   ? "Disc verified" :
+        v.verdict == 2   ? "Disc verified (warnings)" :
+        v.verdict == 3   ? "Disc verification failed" :
+                           "Disc not recognized";
     // th has no dedicated "bad"/error slot (only good/warn) — reuse warn for
     // the warn AND none cases (both are cautionary, matching the ROM-hash
     // line's existing amber-for-"not recognized" convention) and fall back to
-    // a plain red only for the explicit "bad" verdict.
-    LngColor headline_color = (v.verdict == 1) ? th.good
+    // a plain red only for the explicit "bad" verdict. Pending = muted.
+    LngColor headline_color = pending ? th.text_muted
+                              : (v.verdict == 1) ? th.good
                               : (v.verdict == 3) ? lng_rgba(0.945f, 0.322f, 0.322f, 1.0f)
                               : th.warn;
 
-    const LauncherTexture& icon = verdict_texture(v.verdict);
+    const LauncherTexture& icon = verdict_texture(pending ? 0 : v.verdict);
     float ih = ImGui::GetTextLineHeight() * 1.35f;
     float iw = (icon.id && icon.h > 0) ? ih * ((float)icon.w / (float)icon.h) : ih;
     float w = iw + px(6) + ImGui::CalcTextSize(headline).x;
@@ -653,23 +1049,48 @@ void draw_verdict_block(const LauncherModel* m, const LauncherTheme& th, float a
         ImVec2 p = ImGui::GetCursorScreenPos();
         ImGui::GetWindowDrawList()->AddImage(tid(icon), p, ImVec2(p.x + iw, p.y + ih));
         ImGui::Dummy(ImVec2(iw, ih));
-    } else {
+    } else if (!pending) {
         state_mark(v.verdict == 1, th);   // icon failed to load: vector fallback
+    } else {
+        ImGui::Dummy(ImVec2(iw, ih));
     }
     ImGui::SameLine(0, px(6));
     ImGui::TextColored(col(headline_color), "%s", headline);
     ImGui::Dummy(ImVec2(0, px(8)));
 
-    // Checklist: Serial / Region / ISO header, each with its own pass/fail
-    // mark, derived straight from the minimal VerifyResult fields.
+    // Checklist: Serial / Region / ISO header. Before a disc is chosen, show
+    // em-dashes with no pass/fail marks so the layout still reserves the rows.
     if (ImGui::BeginTable("verdict_checklist", 3, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(76));
         ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("m", ImGuiTableColumnFlags_WidthFixed, px(28));
-        kv_row("Serial",     v.serial[0] ? v.serial : "\xE2\x80\x94", th, true, v.serial[0] != '\0');
-        kv_row("Region",     v.region[0] ? v.region : "\xE2\x80\x94", th, true, v.region[0] != '\0');
-        kv_row("ISO header", v.iso_ok ? "OK" : "Mismatch",             th, true, v.iso_ok);
+        const char* dash = "\xE2\x80\x94";
+        kv_row("Serial",     pending ? dash : (v.serial[0] ? v.serial : dash),
+               th, !pending, v.serial[0] != '\0');
+        kv_row("Region",     pending ? dash : (v.region[0] ? v.region : dash),
+               th, !pending, v.region[0] != '\0');
+        kv_row("ISO header", pending ? dash : (v.iso_ok ? "OK" : "Mismatch"),
+               th, !pending, v.iso_ok);
+        // TOC fingerprinting is a netplay capability, not part of ordinary
+        // offline disc identification. Never expose it for offline titles,
+        // even if a host accidentally leaves stale netplay fields populated.
+        if (m->netplay_supported && !pending &&
+            (v.track_count > 0 || v.netplay_detail[0])) {
+            char tracks_buf[32];
+            if (v.track_count > 0)
+                std::snprintf(tracks_buf, sizeof(tracks_buf), "%d", v.track_count);
+            else
+                std::snprintf(tracks_buf, sizeof(tracks_buf), "%s", dash);
+            kv_row("Tracks", tracks_buf, th, true, v.netplay_ok != 0);
+        }
         ImGui::EndTable();
+    }
+    if (m->netplay_supported && !pending &&
+        v.netplay_detail[0] && !v.netplay_ok) {
+        ImGui::Dummy(ImVec2(0, px(4)));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + availw);
+        ImGui::TextColored(col(th.warn), "%s", v.netplay_detail);
+        ImGui::PopTextWrapPos();
     }
 }
 
@@ -690,7 +1111,7 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
         // Reserve space for everything under the art: verified line + 2 meta rows
         // + Change ROM, plus the SAVES block when this game has battery SRAM.
         float reserve = px(198.0f);
-        if (disc_verdict) reserve += px(96.0f);           // taller: icon+headline + 3-row checklist
+        if (disc_verdict) reserve += px(120.0f);          // taller: icon+headline + tracks row
         if (m->saves_supported) reserve += px(96.0f);    // compact SAVES row below Change ROM
         if (m->password_save_path) reserve += px(96.0f); // password-save row (same footprint)
         if (m->msu1_patch_available) reserve += px(198.0f);  // MSU-1 patch-available sub-block
@@ -740,20 +1161,20 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
     snprintf(change_label, sizeof(change_label), "Change %s", noun);
     if (ImGui::Button(change_label, ImVec2(availw, px(34)))) {
         // Native file dialog filter comes from the active console's
-        // SystemProfile.rom_filter — never a hardcoded SNES set. Falls back
-        // to launcher_pick_rom's built-in filter only if a profile omits it.
+        // SystemProfile.rom_filter — never a hardcoded per-system set. Every
+        // shipped profile supplies one; the fallback is console-NEUTRAL (all
+        // files, titled with this console's own rom_noun) so a profile that
+        // forgets rom_filter degrades to "any file" rather than prompting for
+        // some other machine's media.
         const SystemProfile* prof = (const SystemProfile*)m->profile;
         char title[48];
         snprintf(title, sizeof(title), "Select %s", noun);
-        bool picked;
         if (prof && prof->rom_filter.patterns && prof->rom_filter.pattern_count > 0)
-            picked = launcher_pick_file(title, prof->rom_filter.patterns,
-                                        prof->rom_filter.pattern_count,
-                                        prof->rom_filter.desc,
-                                        g_pick_buf, sizeof(g_pick_buf));
+            request_rom_picker(m, title, prof->rom_filter.patterns,
+                               prof->rom_filter.pattern_count,
+                               prof->rom_filter.desc, false);
         else
-            picked = launcher_pick_rom(g_pick_buf, sizeof(g_pick_buf));
-        if (picked) launcher_model_set_rom(m, g_pick_buf);
+            request_rom_picker(m, title, NULL, 0, NULL, false);
     }
 
     // MSU-1 patch-available sub-block: this game ships an IPS patch that
@@ -797,7 +1218,7 @@ void draw_game_panel(LauncherModel* m, const LauncherTheme& th, bool fill_h = fa
     // Content lives in draw_save_row() (the Save module's shared row-drawer,
     // also used standalone by panel_save's own card — see below); folding it
     // in here, uncarded, is what preserves today's exact GAME-card layout.
-    if (m->saves_supported || m->password_save_path) {
+    if (m->saves_supported || m->password_save_path || m->password_sram_path) {
         ImGui::Dummy(ImVec2(0, px(8)));
         ImGui::PushStyleColor(ImGuiCol_Separator, col(th.border));
         ImGui::Separator();
@@ -815,11 +1236,13 @@ void draw_save_row(LauncherModel* m, const LauncherTheme& th) {
     // Password/mantra save variant (e.g. Faxanadu): the row shows the current
     // password text instead of a binary save file. Editable behind an Edit ->
     // type -> Save confirm step, mirroring the legacy NES launcher's flow.
-    if (m->password_save_path) {
+    if (m->password_save_path || m->password_sram_path) {
         static bool s_pw_editing = false;
         static char s_pw_buf[128];
-        const char* label = (m->password_save_label && m->password_save_label[0])
-                              ? m->password_save_label : "Password";
+        const char* label = (m->password_sram_label && m->password_sram_label[0])
+                              ? m->password_sram_label
+                              : ((m->password_save_label && m->password_save_label[0])
+                                     ? m->password_save_label : "Password");
         ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(label);
@@ -967,7 +1390,8 @@ void draw_memcard_slot(LauncherModel* m, const LauncherTheme& th, int slot) {
     float img_h;
     if (g_save_fill_h) {
         const float avail_h = ImGui::GetContentRegionAvail().y;
-        img_h = avail_h - px(78.0f);                              // reserve grid + buttons
+        // Grid + gap + Browse/New + bottom pad — keep buttons clear of the frame.
+        img_h = avail_h - px(110.0f);
         const float img_h_by_w = (0.50f * slotw) * (164.0f / 148.0f);  // cap width ~half
         if (img_h > img_h_by_w) img_h = img_h_by_w;
         if (img_h < px(92.0f))  img_h = px(92.0f);
@@ -1017,7 +1441,7 @@ void draw_memcard_slot(LauncherModel* m, const LauncherTheme& th, int slot) {
     ImGui::PopStyleColor();
 
     // Resume the card body BELOW the image, full width.
-    ImGui::SetCursorPos(ImVec2(start_x, top_y + ih + px(10.0f)));
+    ImGui::SetCursorPos(ImVec2(start_x, top_y + ih + px(14.0f)));
 
     // Dim the rest of the slot body when disabled (visual only; the Browse/New
     // controls stay clickable so the slot can be re-configured while off).
@@ -1043,18 +1467,18 @@ void draw_memcard_slot(LauncherModel* m, const LauncherTheme& th, int slot) {
         ImGui::Dummy(ImVec2(cell * kB + bgap * (kB - 1), cell));
     }
 
-    // Push the Browse/New buttons toward the bottom so a fill-height slot card
-    // (bottom-flush with the boxart column) doesn't strand them mid-card. In
-    // the hugging layout just leave the usual small gap.
+    // Gap above Browse/New only — bottom inset is Child WindowPadding (same as
+    // the top). An extra bottom Dummy doubled the pad and looked top-heavy.
     static const char* kCardPatterns[] = { "*.mcd", "*.mcr", "*.mc" };
     const float cw = ImGui::GetContentRegionAvail().x;
     const float bw = (cw - px(th.spacing_sm)) * 0.5f;
     const float btn_h = px(32.0f);
+    const float btn_gap = px(16.0f);
     if (g_save_fill_h) {
         const float slack = ImGui::GetContentRegionAvail().y - btn_h;
-        ImGui::Dummy(ImVec2(0, slack > px(10.0f) ? slack : px(10.0f)));
+        ImGui::Dummy(ImVec2(0, slack > btn_gap ? slack : btn_gap));
     } else {
-        ImGui::Dummy(ImVec2(0, px(10.0f)));
+        ImGui::Dummy(ImVec2(0, btn_gap));
     }
     if (ImGui::Button("Browse", ImVec2(bw, btn_h))) {
         char buf[512];
@@ -1090,27 +1514,47 @@ int avail_save(const LauncherModel* m) {
     return 0;
 }
 
+// Fixed logical width for dashboard player / memcard cards. Extra horizontal
+// space adds more columns instead of stretching each card.
+static float dash_card_width(float availw, float gap, int count) {
+    const float pref = px(300.0f);
+    if (count < 1) count = 1;
+    int cols = (int)((availw + gap) / (pref + gap));
+    if (cols < 1) cols = 1;
+    if (cols > count) cols = count;
+    float cardw = pref;
+    if (cols == 1 && availw < pref) cardw = availw;  // narrow: shrink to fit
+    return cardw;
+}
+
+static int dash_card_columns(float availw, float gap, float cardw, int count) {
+    if (count < 1) return 1;
+    int cols = (int)((availw + gap) / (cardw + gap));
+    if (cols < 1) cols = 1;
+    if (cols > count) cols = count;
+    return cols;
+}
+
 void panel_save_draw(LauncherModel* m, const LauncherTheme* th) {
     const SystemProfile* prof = (const SystemProfile*)m->profile;
     const SaveKind kind = prof ? prof->save.kind : SAVE_NONE;
     if (kind == SAVE_MEMCARD) {
         // No outer "MEMORY CARDS" card/eyebrow: the small per-slot cards ARE the
-        // UI (each self-labels with a memcard icon + "Memory Card N"). Laid side
-        // by side at ~a controller-card width, the whole row is short enough to
-        // sit under the controller card without scrolling.
+        // UI. Fixed width (same as player cards); wider windows add columns
+        // instead of stretching the pair across the column.
         const int slots = (prof->save.slots > 0 && prof->save.slots <= 2) ? prof->save.slots : 2;
         const float gap = px(th->spacing_sm);
         const float avail = ImGui::GetContentRegionAvail().x;
-        const float cw = (avail - gap * (slots - 1)) / (float)slots;
-        // When the dashboard asks the SAVE panel to fill (wide PSX layout), the
-        // slot cards take the full remaining column height so their bottoms sit
-        // flush with the boxart card on the left. Only do it when there's real
-        // room; otherwise (narrow/stacked layout) hug the content as before.
+        const float cw = dash_card_width(avail, gap, slots);
+        const int cols = dash_card_columns(avail, gap, cw, slots);
+        // Multitap fill-height: slot cards take the reserved band under the
+        // controller stack. 2P / narrow leave g_save_fill_h false and hug.
         const float fill_h = ImGui::GetContentRegionAvail().y;
         const bool do_fill = g_save_fill_h && fill_h > px(180.0f);
         g_save_fill_h = do_fill;   // draw_memcard_slot reads this for the bottom slack
         for (int slot = 0; slot < slots; ++slot) {
-            if (slot) ImGui::SameLine(0, gap);
+            if (slot % cols) ImGui::SameLine(0, gap);
+            else if (slot) ImGui::Dummy(ImVec2(0, gap));
             char cid[16]; snprintf(cid, sizeof(cid), "mcc%d", slot);
             char pid[16]; snprintf(pid, sizeof(pid), "mcp%d", slot);
             begin_container(cid, ImVec2(cw, do_fill ? fill_h : 0.0f),
@@ -1321,17 +1765,18 @@ void panel_tpak_draw(LauncherModel* m, const LauncherTheme* th) {
     }
 }
 
-// PSX-style 3-way pad-mode selector: Hybrid / Analog / D-Pad segmented row.
-// Caller only draws this when pad_mode_supported && pad_mode_selectable (a
-// locked mode draws nothing — there's nothing to pick). The Hybrid segment is
-// itself hidden when !allow_hybrid, matching the original PSX launcher.
+// PSX-style pad-mode selector: Analog / D-Pad segmented row. Caller only draws
+// this when pad_mode_supported && pad_mode_selectable (a locked mode draws
+// nothing — there's nothing to pick). Hybrid is deliberately absent: it is a
+// mod-only mode a trusted game plugin requests at runtime, never a player
+// choice.
 void pad_mode_selector(LauncherModel* m, const LauncherTheme& th, int p, float w) {
     struct Seg { int mode; const char* label; };
     Seg segs[8];
     int n = 0;
     // A console with a custom pad-mode list (ControllerSpec.modes, e.g. Genesis
     // 3-Button/6-Button) drives the segments from that list; otherwise the
-    // legacy PSX-shaped Hybrid/Analog/D-Pad set (Hybrid gated by allow_hybrid).
+    // legacy PSX-shaped Analog/D-Pad set.
     const SystemProfile* prof = (const SystemProfile*)m->profile;
     if (prof && prof->controller.modes && prof->controller.mode_count > 0) {
         int mc = prof->controller.mode_count;
@@ -1339,24 +1784,42 @@ void pad_mode_selector(LauncherModel* m, const LauncherTheme& th, int p, float w
         for (int i = 0; i < mc; ++i)
             segs[n++] = { prof->controller.modes[i].mode, prof->controller.modes[i].label };
     } else {
-        if (m->allow_hybrid) segs[n++] = { 0, "Hybrid" };
         segs[n++] = { 1, "Analog" };
         segs[n++] = { 2, "D-Pad" };
     }
+
+    // Keyboard has no analog sticks — Analog is unavailable (PSX modes).
+    const bool kb_digital_only =
+        m->s.player_src[p] == 1 &&
+        !(prof && prof->controller.modes && prof->controller.mode_count > 0);
 
     const float gap = px(4.0f);
     const float seg_w = (w - gap * (n - 1)) / n;
     for (int i = 0; i < n; ++i) {
         if (i) ImGui::SameLine(0, gap);
         bool sel = m->s.pad_mode[p] == segs[i].mode;
+        // Analog needs sticks; grey out on keyboard.
+        const bool stick_mode = (segs[i].mode == 1);
+        const bool disabled = kb_digital_only && stick_mode;
         ImGui::PushID(i);
-        ImGui::PushStyleColor(ImGuiCol_Button, sel ? col(th.accent) : col(th.control));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, sel ? col(th.accent) : col(th.control_hovered));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, col(th.accent));
-        ImGui::PushStyleColor(ImGuiCol_Text, sel ? col(th.accent_text) : col(th.text));
-        if (ImGui::Button(segs[i].label, ImVec2(seg_w, px(28))))
-            launcher_model_set_pad_mode(m, p, segs[i].mode);
-        ImGui::PopStyleColor(4);
+        if (disabled) {
+            ImGui::BeginDisabled();
+            ImGui::PushStyleColor(ImGuiCol_Button, col(th.control));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col(th.control));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, col(th.control));
+            ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+            ImGui::Button(segs[i].label, ImVec2(seg_w, px(28)));
+            ImGui::PopStyleColor(4);
+            ImGui::EndDisabled();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, sel ? col(th.accent) : col(th.control));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, sel ? col(th.accent) : col(th.control_hovered));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, col(th.accent));
+            ImGui::PushStyleColor(ImGuiCol_Text, sel ? col(th.accent_text) : col(th.text));
+            if (ImGui::Button(segs[i].label, ImVec2(seg_w, px(28))))
+                launcher_model_set_pad_mode(m, p, segs[i].mode);
+            ImGui::PopStyleColor(4);
+        }
         ImGui::PopID();
     }
 }
@@ -1371,8 +1834,12 @@ void pad_mode_selector(LauncherModel* m, const LauncherTheme& th, int p, float w
 // (off); otherwise it is the single legacy "Keyboard" entry, byte-for-byte
 // identical to before for every non-mouse game.
 void draw_source_selectables(LauncherModel* m, int p) {
-    if (ImGui::Selectable("None", m->s.player_src[p] == 0))
-        launcher_model_set_source(m, p, 0, 0, nullptr);
+    const SystemProfile* src_prof = (const SystemProfile*)m->profile;
+    const bool psx = src_prof && src_prof->id && !strcmp(src_prof->id, "psx");
+    if (ImGui::Selectable("None", m->s.player_src[p] == 0)) {
+        launcher_model_set_source(m, p, 0, 0, nullptr, nullptr);
+        if (psx) launcher_binds_refresh(m);
+    }
     if (m->has_mouse_controls && p == 0) {
         const bool kbm = m->s.player_src[p] == 1 && m->s.mouse_enabled;
         const bool kb  = m->s.player_src[p] == 1 && !m->s.mouse_enabled;
@@ -1381,28 +1848,164 @@ void draw_source_selectables(LauncherModel* m, int p) {
         if (ImGui::Selectable("Keyboard", kb))
             launcher_model_set_mouse_source(m, 0);
     } else {
-        if (ImGui::Selectable("Keyboard", m->s.player_src[p] == 1))
-            launcher_model_set_source(m, p, 1, 0, nullptr);
+        if (ImGui::Selectable("Keyboard", m->s.player_src[p] == 1)) {
+            launcher_model_set_source(m, p, 1, 0, nullptr, nullptr);
+            if (psx) launcher_binds_refresh(m);
+        }
     }
-    for (int i = 0; i < g_pad_count; ++i) {
-        bool sel = m->s.player_src[p] == 2 && m->player_pad_id[p] == g_pads[i].id;
-        if (ImGui::Selectable(g_pads[i].name, sel))
-            launcher_model_set_source(m, p, 2, g_pads[i].id, g_pads[i].name);
+
+    // Unified pad list (no duplicates): saved mappings + live devices.
+    // Pads already selected on another player are disabled (keyboard is not).
+    struct PadOpt {
+        char guid[40];
+        char name[64];
+        uint32_t id;
+        bool live;
+    };
+    constexpr int kMaxOpts = LNG_MAX_PADS + 16 + LNG_MAX_PLAYERS;
+    PadOpt opts[kMaxOpts]{};
+    int nopt = 0;
+    auto already = [&](const char* guid) -> bool {
+        if (!guid || !guid[0]) return true;
+        for (int i = 0; i < nopt; ++i)
+            if (std::strcmp(opts[i].guid, guid) == 0) return true;
+        return false;
+    };
+    auto push_opt = [&](const char* guid, const char* name, uint32_t id,
+                        bool live) {
+        if (!guid || !guid[0] || already(guid) || nopt >= kMaxOpts) return;
+        std::snprintf(opts[nopt].guid, sizeof(opts[nopt].guid), "%s", guid);
+        const char* nm = (name && name[0] && std::strcmp(name, "Gamepad") != 0)
+                             ? name : "Controller";
+        std::snprintf(opts[nopt].name, sizeof(opts[nopt].name), "%s", nm);
+        opts[nopt].id = id;
+        opts[nopt].live = live;
+        ++nopt;
+    };
+
+    if (psx) {
+        const int known = launcher_binds_psx_known_count();
+        for (int i = 0; i < known; ++i) {
+            char guid[40] = {}, name[64] = {};
+            if (!launcher_binds_psx_known_at(i, guid, (int)sizeof(guid),
+                                             name, (int)sizeof(name)))
+                continue;
+            uint32_t id = 0;
+            bool live = false;
+            const bool custom = launcher_binds_psx_name_is_custom(guid) != 0;
+            for (int j = 0; j < g_pad_count; ++j) {
+                if (g_pads[j].guid[0] &&
+                    std::strcmp(g_pads[j].guid, guid) == 0) {
+                    live = true;
+                    id = g_pads[j].id;
+                    // Custom rename wins; otherwise prefer the live driver name.
+                    if (!custom && g_pads[j].name[0] &&
+                        std::strcmp(g_pads[j].name, "Gamepad") != 0)
+                        std::snprintf(name, sizeof(name), "%s", g_pads[j].name);
+                    break;
+                }
+            }
+            push_opt(guid, name, id, live);
+        }
+        // Settings-restored GUID that isn't in the registry yet.
+        if (m->s.player_src[p] == 2 && m->s.player_gamepad_guid[p][0]) {
+            bool live = false;
+            uint32_t id = m->player_pad_id[p];
+            for (int j = 0; j < g_pad_count; ++j) {
+                if (g_pads[j].guid[0] &&
+                    std::strcmp(g_pads[j].guid,
+                                m->s.player_gamepad_guid[p]) == 0) {
+                    live = true;
+                    id = g_pads[j].id;
+                    break;
+                }
+            }
+            push_opt(m->s.player_gamepad_guid[p], m->player_pad_name[p], id,
+                     live);
+        }
     }
-    if (g_pad_count == 0) {
+
+    for (int i = 0; i < g_pad_count; ++i)
+        push_opt(g_pads[i].guid, g_pads[i].name, g_pads[i].id, true);
+
+    const int claim_n = launcher_model_visible_player_count(m);
+    for (int i = 0; i < nopt; ++i) {
+        bool claimed = false;
+        for (int o = 0; o < claim_n; ++o) {
+            if (o == p) continue;
+            if (m->s.player_src[o] == 2 && m->s.player_gamepad_guid[o][0] &&
+                std::strcmp(m->s.player_gamepad_guid[o], opts[i].guid) == 0) {
+                claimed = true;
+                break;
+            }
+        }
+        char label[96];
+        if (opts[i].live)
+            std::snprintf(label, sizeof(label), "%s", opts[i].name);
+        else
+            std::snprintf(label, sizeof(label), "%s (disconnected)",
+                          opts[i].name);
+        const bool sel = m->s.player_src[p] == 2 &&
+                         m->s.player_gamepad_guid[p][0] &&
+                         std::strcmp(m->s.player_gamepad_guid[p],
+                                     opts[i].guid) == 0;
+        if (claimed) ImGui::BeginDisabled();
+        if (ImGui::Selectable(label, sel) && !claimed) {
+            launcher_model_set_source(m, p, 2, opts[i].id, opts[i].name,
+                                     opts[i].guid);
+            if (psx) {
+                launcher_binds_apply_psx_pad_profile(m, p);
+                launcher_binds_refresh(m);
+            }
+        }
+        if (claimed) ImGui::EndDisabled();
+    }
+
+    if (nopt == 0) {
         ImGui::BeginDisabled();
         ImGui::Selectable("(no gamepad connected)");
         ImGui::EndDisabled();
     }
 }
 
+/* Best-effort local lobby seat (0-based) for the NETPLAY pad card label.
+ * Prefers fill_launch.local_slot, else display_name match, else host→0.
+ * Label only — runtime netplay always samples dashboard card 0. */
+static int np_guess_local_seat(const LauncherModel* m) {
+    if (!m || !m->netplay_supported) return 0;
+    const auto* np = m->netplay;
+    if (!np || !np->ctx) return 0;
+    if (np->fill_launch) {
+        RecompLauncherCNetplayLaunch launch{};
+        if (np->fill_launch(np->ctx, &launch) && launch.enabled &&
+            launch.local_slot >= 0)
+            return launch.local_slot;
+    }
+    const char* me = m->s.netplay_player_name;
+    if ((!me || !me[0]) && np->player_name)
+        me = np->player_name(np->ctx);
+    if (np->member_count && np->member_get && me && me[0]) {
+        const int n = np->member_count(np->ctx);
+        for (int i = 0; i < n; ++i) {
+            RecompLauncherCNetplayMember mem{};
+            if (!np->member_get(np->ctx, i, &mem)) continue;
+            if (mem.display_name[0] && std::strcmp(mem.display_name, me) == 0)
+                return mem.slot >= 0 ? mem.slot : i;
+        }
+    }
+    if (np->is_host && np->is_host(np->ctx)) return 0;
+    return 0;
+}
+
 void draw_player_panel(LauncherModel* m, const LauncherTheme& th, int p, float w) {
     char id[24];  snprintf(id, sizeof(id), "player%d", p);
-    char eb[32];
-    if (p == 0 && m->netplay_supported)
-        snprintf(eb, sizeof(eb), "PLAYER 1 / NETPLAY");
-    else
+    char eb[40];
+    if (p == 0 && m->netplay_supported) {
+        const int seat = np_guess_local_seat(m);
+        snprintf(eb, sizeof(eb), "PLAYER %d / NETPLAY", seat + 1);
+    } else {
         snprintf(eb, sizeof(eb), "PLAYER %d", p + 1);
+    }
 
     if (!begin_panel(id, w, false)) { end_panel(); return; }
     ImGui::PushID(p);
@@ -1418,7 +2021,15 @@ void draw_player_panel(LauncherModel* m, const LauncherTheme& th, int p, float w
     {
         const SystemProfile* aprof = (const SystemProfile*)m->profile;
         const bool has_swap_art = aprof && aprof->controller.image_analog != nullptr;
-        const bool digital = has_swap_art && m->s.pad_mode[p] == 2;
+        // Show the digital pad ONLY for a game LOCKED to D-Pad mode. pad_mode
+        // selects which controller PROTOCOL the game is given, not which
+        // hardware the player is holding: on a title that offers analog at all,
+        // the player has an analog-capable pad in hand, and picking D-Pad mode
+        // does not turn their DualShock into a 1994 digital controller. Keying
+        // the art off the mode made Ape Escape — a dual-analog game — show the
+        // original PSX pad whenever the saved mode happened to be digital.
+        const bool digital_only = !m->pad_mode_selectable && m->locked_pad_mode == 2;
+        const bool digital = has_swap_art && digital_only;
         const LauncherTexture& art = has_swap_art
             ? (digital ? g_pad_digital : g_pad_analog) : g_pad;
         // Center on the FITTED width so a near-square pad (N64) or a portrait
@@ -1464,27 +2075,28 @@ void draw_player_panel(LauncherModel* m, const LauncherTheme& th, int p, float w
     end_panel();
 }
 
-// Lays out the player cards: one card for a 1-player game, two side-by-side
-// for a 2-player game, a 2x2/2+1 wrap for 3–5 (N64 4-port, PSX multitap).
-// Driven by the model, never hardcoded.
+// Lays out player cards: stretch to fill the row until there is room for
+// another card at the standard width, then bump the column count (memcards
+// stay fixed-width via dash_card_width).
 void draw_controllers_row(LauncherModel* m, const LauncherTheme& th) {
     if (m->lock_device) return;   // fixed pad: hide the player controller cards entirely
-    int n = m->player_count;
+    int n = launcher_model_visible_player_count(m);
     if (n < 1) n = 1;
     if (n > LNG_MAX_PLAYERS) n = LNG_MAX_PLAYERS;
     const float gap = px(th.spacing_md);
     const float availw = ImGui::GetContentRegionAvail().x;
-    // A 2P game splits the row; a 1P game gets ONE card of the same size rather
-    // than a full-width card with a lone pad floating in it. 3–5 players wrap
-    // into rows of two same-size cards (last row may hold a single card).
-    float cardw = (availw - gap) * 0.5f;
-    if (n == 1 && cardw < px(300.0f)) cardw = availw;   // narrow window: fill
-    static const char* kCardIds[LNG_MAX_PLAYERS] = {
-        "pc0", "pc1", "pc2", "pc3", "pc4"};
+    const float pref = px(300.0f);
+    int cols = (int)((availw + gap) / (pref + gap));
+    if (cols < 1) cols = 1;
+    if (cols > n) cols = n;
+    float cardw = (availw - gap * (float)(cols - 1)) / (float)cols;
+    if (cardw < 1.0f) cardw = availw;
     for (int p = 0; p < n; ++p) {
-        if (p & 1) ImGui::SameLine(0, gap);
+        if (p % cols) ImGui::SameLine(0, gap);
         else if (p) ImGui::Dummy(ImVec2(0, gap));   // new row of cards
-        begin_container(kCardIds[p], ImVec2(cardw, 0), ImGuiChildFlags_AutoResizeY);
+        char cid[16];
+        std::snprintf(cid, sizeof(cid), "pc%d", p);
+        begin_container(cid, ImVec2(cardw, 0), ImGuiChildFlags_AutoResizeY);
         draw_player_panel(m, th, p, cardw);
         end_container();
     }
@@ -1506,6 +2118,10 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
     const LauncherPanel* ctrl_p = find_composed(prof->panels_dashboard, "controller", m);
     const LauncherPanel* save_p = find_composed(prof->panels_dashboard, "save", m);
     const LauncherPanel* tpak_p = find_composed(prof->panels_dashboard, "tpak", m);
+    // Online identity: stacks directly under the controller card in the
+    // right column (double opt-in — see avail_identity).
+    const LauncherPanel* ident_p =
+        find_composed(prof->panels_dashboard, "identity", m);
 
     if (logical_w >= 820) {
         const float gap = px(th.spacing_md);
@@ -1518,30 +2134,60 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
         const bool has_save = (save_p != nullptr);
         const bool has_tpak = (tpak_p != nullptr);
         if (has_save) {
-            // Hug-then-fill: the left column hugs the box art; the right column
-            // is made exactly as tall as it, so the controller card hugs at the
-            // top and the memory-card card fills the rest — its bottom sits
-            // flush with the box-art card on the left.
-            float left_h = 0.0f;
+            // Capture body height before the row so multitap can grow the right
+            // column to the footer.
+            const float row_h = ImGui::GetContentRegionAvail().y;
+            // 2P: AutoResizeY the right column so hug-height memcards (with
+            // even Browse/New pad) are never clipped by a boxart-height cap.
+            // Multitap (3+): fill to footer and scroll controllers when they
+            // would crush the save band.
+            const bool many_players = launcher_model_visible_player_count(m) > 2;
             if (game_p) {
                 g_game_fill_h = false;
                 begin_container("dash_l", ImVec2(px(400), 0), ImGuiChildFlags_AutoResizeY);
                 game_p->draw(m, &th);
                 end_container();
-                left_h = ImGui::GetItemRectSize().y;
             }
             if (game_p && ctrl_p) ImGui::SameLine(0, gap);
             if (ctrl_p) {
-                begin_container("dash_r", ImVec2(0, left_h > 0.0f ? left_h : 0.0f),
-                                ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-                    ctrl_p->draw(m, &th);
+                if (many_players) {
+                    const float right_h = row_h > px(80.0f) ? row_h : px(80.0f);
+                    begin_container("dash_r", ImVec2(0, right_h),
+                                    ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+                    // Tall enough for a clean fill-height memcard pair (icon,
+                    // grid, Browse/New with padding) while controllers scroll
+                    // in the space above.
+                    const float save_reserve = save_p ? px(300.0f) : 0.0f;
+                    float ctrl_h = ImGui::GetContentRegionAvail().y
+                                   - save_reserve - (save_p ? gap : 0.0f);
+                    if (ctrl_h < px(100.0f)) ctrl_h = px(100.0f);
+                    begin_container("dash_ctrl", ImVec2(0, ctrl_h));
+                        ctrl_p->draw(m, &th);
+                    end_container();
+                    if (ident_p) {
+                        ImGui::Dummy(ImVec2(0, gap));
+                        ident_p->draw(m, &th);
+                    }
                     if (save_p) {
                         ImGui::Dummy(ImVec2(0, gap));
-                        g_save_fill_h = (left_h > 0.0f);
+                        g_save_fill_h = true;
                         save_p->draw(m, &th);
                         g_save_fill_h = false;
                     }
-                end_container();
+                    end_container();
+                } else {
+                    begin_container("dash_r", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+                    ctrl_p->draw(m, &th);
+                    if (ident_p) {
+                        ImGui::Dummy(ImVec2(0, gap));
+                        ident_p->draw(m, &th);
+                    }
+                    if (save_p) {
+                        ImGui::Dummy(ImVec2(0, gap));
+                        save_p->draw(m, &th);
+                    }
+                    end_container();
+                }
             }
         } else if (has_tpak) {
             // N64: no SRAM save panel, but a FULL-WIDTH Transfer Pak row follows
@@ -1558,6 +2204,10 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
             if (ctrl_p) {
                 begin_container("dash_r", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
                     ctrl_p->draw(m, &th);
+                    if (ident_p) {
+                        ImGui::Dummy(ImVec2(0, gap));
+                        ident_p->draw(m, &th);
+                    }
                 end_container();
             }
         } else {
@@ -1573,6 +2223,10 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
             if (ctrl_p) {
                 begin_container("dash_r", ImVec2(0, 0), ImGuiChildFlags_None);
                     ctrl_p->draw(m, &th);
+                    if (ident_p) {
+                        ImGui::Dummy(ImVec2(0, gap));
+                        ident_p->draw(m, &th);
+                    }
                 end_container();
             }
         }
@@ -1586,7 +2240,9 @@ void draw_dashboard(LauncherModel* m, const LauncherTheme& th, int logical_w) {
         if (game_p) { g_game_fill_h = false; game_p->draw(m, &th); }
         if (game_p && ctrl_p) ImGui::Spacing();
         if (ctrl_p) ctrl_p->draw(m, &th);
-        // Narrow single-column layout: memcards stack under the controller.
+        // Narrow single-column layout: identity and memcards stack under
+        // the controller.
+        if (ident_p) { ImGui::Spacing(); ident_p->draw(m, &th); }
         if (save_p) { ImGui::Spacing(); save_p->draw(m, &th); }
         if (tpak_p) { ImGui::Spacing(); tpak_p->draw(m, &th); }
     }
@@ -1615,7 +2271,11 @@ static const char* elide_left(const char* s, float max_w, char* out, size_t cap)
 bool any_deep_display(const LauncherModel* m) {
     return m->has_window_size || m->has_renderer || m->has_supersampling ||
            m->has_antialiasing || m->has_texture_filter || m->has_screen_kind ||
-           m->has_frame_interp || m->has_skip_fmv || m->has_turbo_loads;
+           m->has_fmv_filter ||
+           m->has_frame_interp || m->has_skip_fmv ||
+           m->has_geometry_precision ||
+           m->has_rewind_depth || m->has_vsync;
+           /* has_turbo_loads is intentionally absent: it draws no row (below). */
 }
 
 // Whether the DISPLAY card should grow to fit its content (AutoResizeY) rather
@@ -1626,23 +2286,78 @@ bool any_deep_display(const LauncherModel* m) {
 // the fixed height (byte-identical to before this console existed).
 bool video_card_grows(const LauncherModel* m) {
     if (any_deep_display(m)) return true;
-    if (m->adaptive_view_supported) return true;
+    if (m->has_shader) return true;
+    if (m->has_sharp_filter || m->has_affine_filter) return true;
+    if (m->num_display_layouts > 0) return true;
     // NES legacy-surface additions (Integer scaling row, HD texture pack block)
     // add extra rows the fixed no_scroll band wasn't sized for.
     if (m->has_integer_scale || m->hdpack_supported) return true;
-    const SystemProfile* prof = (const SystemProfile*)m->profile;
-    return prof && prof->video.widescreen_cells &&
-           m->widescreen_supported && m->s.widescreen != 0;
+    return false;
 }
 
-// Inline amber "EXPERIMENTAL" tag, drawn on the same row right after a control
-// whose feature is not yet production-ready. Currently every SNES 16:9
-// widescreen path is experimental (per-game rendering still maturing), so the
-// widescreen checkbox always carries this marker. Uses the same th.warn amber
-// as the other cautionary labels (e.g. the MSU-1 notice).
-static void experimental_tag(const LauncherTheme& th) {
-    ImGui::SameLine(0, px(8));
-    ImGui::TextColored(col(th.warn), "EXPERIMENTAL");
+void draw_shader_row(LauncherModel* m, const LauncherTheme& th, float col_w = 0.0f) {
+    if (!m || !m->has_shader) return;
+    row_label("Shader", th, col_w);
+
+    const float browse_w = px(78);
+    const float folder_w = px(72);
+    const float clear_w = px(64);
+    const float gap = px(th.spacing_sm);
+    float combo_w = ImGui::GetContentRegionAvail().x - browse_w - folder_w - clear_w - gap * 3.0f;
+    if (combo_w < px(120)) combo_w = px(120);
+
+    refresh_shader_presets();
+    std::string current_label = m->s.shader_path[0] ? "Custom" : "None";
+    for (const ShaderPresetEntry& preset : g_shader_presets) {
+        if (preset.path == m->s.shader_path) {
+            current_label = preset.label;
+            break;
+        }
+    }
+
+    ImGui::SetNextItemWidth(combo_w);
+    if (ImGui::BeginCombo("##shader_preset", current_label.c_str())) {
+        refresh_shader_presets();
+        if (ImGui::Selectable("None", !m->s.shader_path[0]))
+            launcher_model_clear_shader_path(m);
+        for (const ShaderPresetEntry& preset : g_shader_presets) {
+            bool selected = preset.path == m->s.shader_path;
+            if (ImGui::Selectable(preset.label.c_str(), selected))
+                launcher_model_set_shader_path(m, preset.path.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                ImGui::SetTooltip("%s", preset.path.c_str());
+        }
+        if (m->s.shader_path[0] && current_label == "Custom")
+            ImGui::Selectable("Custom", true, ImGuiSelectableFlags_Disabled);
+        ImGui::EndCombo();
+    }
+    if (m->s.shader_path[0] && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("%s", m->s.shader_path);
+
+    ImGui::SameLine(0, gap);
+    static const char* kShaderPatterns[] = { "*.glsl", "*.glslp" };
+    if (ImGui::Button("Browse", ImVec2(browse_w, px(30)))) {
+        char buf[512];
+        if (launcher_pick_file("Select GLSL shader", kShaderPatterns, 2,
+                               "GLSL shader (.glsl .glslp)", buf, sizeof(buf)))
+            launcher_model_set_shader_path(m, buf);
+    }
+    ImGui::SameLine(0, gap);
+    if (ImGui::Button("Folder", ImVec2(folder_w, px(30)))) {
+        std::filesystem::path shader_dir = std::filesystem::path("assets") / "shaders";
+        std::error_code ec;
+        std::filesystem::create_directories(shader_dir, ec);
+        if (ImGui::GetPlatformIO().Platform_OpenInShellFn)
+            ImGui::GetPlatformIO().Platform_OpenInShellFn(ImGui::GetCurrentContext(),
+                                                          shader_dir.string().c_str());
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Open assets/shaders to add presets.");
+    ImGui::SameLine(0, gap);
+    ImGui::BeginDisabled(!m->s.shader_path[0]);
+    if (ImGui::Button("Clear", ImVec2(clear_w, px(30))))
+        launcher_model_clear_shader_path(m);
+    ImGui::EndDisabled();
 }
 
 void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
@@ -1650,44 +2365,65 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
 
     if (!any_deep_display(m)) {
         // ---- legacy minimal surface (SNES/NES etc.) — aligned label grid -------
-        float cw = ImGui::CalcTextSize("Linear filtering").x;   // widest legacy label
-        { float t = ImGui::CalcTextSize("View mode").x; if (t > cw) cw = t; }
+        float cw = ImGui::CalcTextSize("Linear filtering").x;
+        if (m->has_sharp_filter) {
+            float t = ImGui::CalcTextSize("Scaling filter").x;
+            if (t > cw) cw = t;
+        }
+        if (m->has_affine_filter) {
+            float t = ImGui::CalcTextSize("Affine background smoothing").x;
+            if (t > cw) cw = t;
+        }
+        if (m->has_shader) {
+            float t = ImGui::CalcTextSize("Shader").x;
+            if (t > cw) cw = t;
+        }
         if (m->has_integer_scale) { float t = ImGui::CalcTextSize("Integer scaling").x; if (t > cw) cw = t; }
         cw += px(18.0f);
         row_label("Window scale", th, cw);
+        ImGui::PushID("window_scale");
         if (ImGui::Button(launcher_model_scale_label(m), ImVec2(px(120), px(30))))
             launcher_model_cycle_scale(m);
+        ImGui::PopID();
         // Universal fullscreen row (every console; tri-state cycle restoring
         // the legacy launcher's Off/Borderless/Exclusive vocabulary). Sits
         // right under Window scale, matching the old Display panel order.
         row_label("Fullscreen", th, cw);
+        ImGui::PushID("fullscreen");
         if (ImGui::Button(launcher_model_fullscreen_label(m), ImVec2(px(120), px(30))))
             launcher_model_cycle_fullscreen(m);
+        ImGui::PopID();
+        if (m->num_display_layouts > 0) {
+            row_label("Screen layout", th, cw);
+            ImGui::PushID("screen_layout");
+            if (ImGui::Button(launcher_model_display_layout_label(m),
+                              ImVec2(px(180), px(30))))
+                launcher_model_cycle_display_layout(m);
+            ImGui::PopID();
+        }
         if (m->has_integer_scale) {   // NES module: snap the image to integer multiples
             row_label("Integer scaling", th, cw);
             bool is = m->s.integer_scale != 0;
             if (ImGui::Checkbox("##intscale", &is)) launcher_model_toggle_integer_scale(m);
         }
-        row_label("Linear filtering", th, cw);
-        bool filter = m->s.linear_filter != 0;
-        if (ImGui::Checkbox("##filter", &filter)) launcher_model_toggle_filter(m);
-        if (m->aspect_mask || m->num_aspect_labels > 0 ||
-            m->widescreen_supported || m->adaptive_view_supported) {
-            row_label("View mode", th, cw);
-            if (ImGui::Button(launcher_model_view_mode_label(m),
+        if (m->has_sharp_filter) {
+            row_label("Scaling filter", th, cw);
+            if (ImGui::Button(launcher_model_scaling_filter_label(m),
                               ImVec2(px(180), px(30))))
-                launcher_model_cycle_view_mode(m);
-            experimental_tag(th);
-            // Genesis-style "extra cells per side" stepper: only when the
-            // console opts in (video.widescreen_cells) AND widescreen is on.
-            const SystemProfile* wprof = (const SystemProfile*)m->profile;
-            if (wprof && wprof->video.widescreen_cells &&
-                m->s.widescreen != 0 && !m->s.adaptive_view) {
-                row_label("Extra cells / side", th, cw);
-                int d = 0; ws_cells_stepper("wscells", m, &d);
-                if (d) launcher_model_ws_cells_delta(m, d);
-            }
+                launcher_model_cycle_scaling_filter(m);
+        } else {
+            row_label("Linear filtering", th, cw);
+            bool filter = m->s.linear_filter != 0;
+            if (ImGui::Checkbox("##filter", &filter))
+                launcher_model_toggle_filter(m);
         }
+        if (m->has_affine_filter) {
+            row_label("Affine background smoothing", th, cw);
+            bool affine = m->s.affine_filter != 0;
+            if (ImGui::Checkbox("##affine_filter", &affine))
+                launcher_model_toggle_affine_filter(m);
+        }
+        draw_shader_row(m, th, cw);
         // HD texture packs (NES module, Mesen hires.txt format): one line —
         //   [x] HD texture pack   …folder tail   [Browse]
         // Mirrors the MSU-1 row in Audio (same enable + folder pattern).
@@ -1716,7 +2452,7 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
     // ---- deeper PSX-style surface, capability-gated per control -----------
     // Order matches the original PSX launcher: Window size, Renderer,
     // Supersampling, Aspect ratio, Texture filtering, Antialiasing, Screen
-    // model, FPS, Skip FMVs, Turbo
+    // model, Frame interpolation (+Presentation target), Skip FMVs, Turbo
     // loads, Fullscreen.
     if (m->has_window_size) {
         row_label("Window size", th);
@@ -1724,8 +2460,10 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
             launcher_model_cycle_window_size(m);
     } else {
         row_label("Window scale", th);
+        ImGui::PushID("window_scale");
         if (ImGui::Button(launcher_model_scale_label(m), ImVec2(px(120), px(30))))
             launcher_model_cycle_scale(m);
+        ImGui::PopID();
     }
 
     // NES module rows can appear on this branch too (has_renderer puts NES
@@ -1737,35 +2475,50 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
         if (ImGui::Checkbox("##intscale", &is)) launcher_model_toggle_integer_scale(m);
     }
 
-    if (m->has_frame_interp) {
-        row_label("FPS", th);
-        if (ImGui::Button(launcher_model_fps_label(m), ImVec2(px(150), px(30))))
-            launcher_model_cycle_fps(m);
+    if (m->has_renderer) {
+        row_label("Renderer", th);
+        if (ImGui::Button(launcher_model_renderer_label(m), ImVec2(px(220), px(30))))
+            launcher_model_toggle_renderer(m);
     }
 
     if (m->has_supersampling) {
         row_label("Supersampling", th);
+        ImGui::PushID("supersampling");
         if (ImGui::Button(launcher_model_supersampling_label(m), ImVec2(px(160), px(30))))
             launcher_model_cycle_supersampling(m);
+        ImGui::PopID();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Internal-resolution SSAA.\n"
+                "Offline: full software/GL supersampling.\n"
+                "Netplay (OpenGL): present quality via GPU FBO;\n"
+                "CPU VRAM authority stays at 1x for snaps/digests.");
+        }
     }
 
     // Universal fullscreen row (every console — no longer gated on the
     // vestigial has_fullscreen_toggle). Tri-state cycle replaces the old
     // binary checkbox so Exclusive mode is reachable again.
     row_label("Fullscreen", th);
+    ImGui::PushID("fullscreen");
     if (ImGui::Button(launcher_model_fullscreen_label(m), ImVec2(px(120), px(30))))
         launcher_model_cycle_fullscreen(m);
-
-    if (m->aspect_mask || m->num_aspect_labels > 0 ||
-        m->widescreen_supported || m->adaptive_view_supported) {
-        row_label("View mode", th);
-        if (ImGui::Button(launcher_model_view_mode_label(m),
+    ImGui::PopID();
+    if (m->num_display_layouts > 0) {
+        row_label("Screen layout", th);
+        ImGui::PushID("screen_layout");
+        if (ImGui::Button(launcher_model_display_layout_label(m),
                           ImVec2(px(180), px(30))))
-            launcher_model_cycle_view_mode(m);
-        experimental_tag(th);
+            launcher_model_cycle_display_layout(m);
+        ImGui::PopID();
     }
 
-    if (m->has_texture_filter) {
+    if (m->has_sharp_filter) {
+        row_label("Scaling filter", th);
+        if (ImGui::Button(launcher_model_scaling_filter_label(m),
+                          ImVec2(px(180), px(30))))
+            launcher_model_cycle_scaling_filter(m);
+    } else if (m->has_texture_filter) {
         row_label("Texture filtering", th);
         if (ImGui::Button(launcher_model_texture_filter_label(m), ImVec2(px(120), px(30))))
             launcher_model_toggle_texture_filter(m);
@@ -1777,8 +2530,66 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
 
     if (m->has_antialiasing) {
         row_label("Antialiasing", th);
+        ImGui::PushID("antialiasing");
         if (ImGui::Button(launcher_model_aa_label(m), ImVec2(px(90), px(30))))
             launcher_model_cycle_aa(m);
+        ImGui::PopID();
+    }
+
+    /* FMV reconstruction. Distinct from Texture filtering above: that samples
+     * the rasterizer's textures, this scales a decoded video frame up to the
+     * window, and the good answer differs between the two. Antialiasing off
+     * means nearest everywhere, so the row has nothing to say then. */
+    if (m->has_fmv_filter) {
+        row_label("FMV filtering", th);
+        ImGui::PushID("fmv_filter");
+        const bool aa_off = m->has_antialiasing && m->s.antialiasing == 0;
+        if (aa_off) ImGui::BeginDisabled();
+        if (ImGui::Button(aa_off ? "Nearest"
+                                 : launcher_model_fmv_filter_label(m),
+                          ImVec2(px(120), px(30))))
+            launcher_model_cycle_fmv_filter(m);
+        if (aa_off) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Antialiasing is off, so video is presented "
+                                  "with hard pixels.");
+        }
+        ImGui::PopID();
+    }
+
+    if (m->has_affine_filter) {
+        row_label("Affine background smoothing", th);
+        bool affine = m->s.affine_filter != 0;
+        if (ImGui::Checkbox("##affine_filter", &affine))
+            launcher_model_toggle_affine_filter(m);
+    }
+
+    draw_shader_row(m, th);
+
+    if (m->has_geometry_precision) {
+        // Geometry correction deliberately draws NO row. It moves vertices, and
+        // the runtime can only recover the sub-pixel original for ~5% of them
+        // (93% of lookups are ambiguous), so a corrected triangle meets an
+        // uncorrected neighbour and their shared edge splits open. Measured on
+        // Ape Escape; see psxrecomp ENHANCEMENTS.md G1.8/G1.9. The setting stays
+        // in the ABI and remains readable from game.toml/settings.toml so the
+        // work is still testable, exactly as has_turbo_loads/Settings.turbo_loads
+        // stayed after their row was dropped — it simply has no control.
+        //
+        // Perspective textures are unaffected by that problem: they only change
+        // UV interpolation inside a polygon whose provenance is already proven,
+        // so no vertex moves and adjacent polygons cannot disagree about an edge.
+        row_label("Perspective textures", th);
+        bool persp = m->s.perspective_texturing != 0;
+        if (ImGui::Checkbox("##persptex", &persp))
+            launcher_model_toggle_perspective_texturing(m);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Interpolates textures with perspective, which "
+                              "stops large floors and walls from warping as the "
+                              "camera moves.\n\nApplied only to polygons the "
+                              "runtime can prove came from the 3D pipeline, so "
+                              "2D art and menus are left alone.");
     }
 
     if (m->has_screen_kind) {
@@ -1789,38 +2600,98 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
             launcher_model_cycle_screen_kind(m);
     }
 
+    // Frame interpolation is only meaningful under OpenGL (Software has no
+    // interpolation pass); Presentation target only matters once frame
+    // interpolation is actually on.
+    if (m->has_frame_interp && m->s.renderer) {
+        row_label("Frame interpolation", th);
+        bool fi = m->s.frame_interp != 0;
+        if (ImGui::Checkbox("##fi", &fi)) launcher_model_toggle_frame_interp(m);
+        if (m->s.frame_interp) {
+            row_label("Presentation target", th);
+            if (ImGui::Button(launcher_model_interp_fps_label(m), ImVec2(px(150), px(30))))
+                launcher_model_cycle_interp_fps(m);
+        }
+    }
+
+    // VSync sits with frame interpolation because both decide how a finished
+    // frame reaches the panel, not how it is drawn.
+    if (m->has_vsync) {
+        row_label("VSync", th);
+        if (ImGui::Button(launcher_model_vsync_label(m), ImVec2(px(120), px(30))))
+            launcher_model_cycle_vsync(m);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "On: the swap waits for the panel — no tearing.\n"
+                "Off: swap immediately — lowest display latency, may tear.\n"
+                "Adaptive: vsync while the game keeps up, immediate when it "
+                "drops below the refresh rate.\n\n"
+                "The runtime still paces frames to the console's own rate "
+                "either way, so Off does not run the game fast.");
+        }
+    }
+
     if (m->has_skip_fmv) {
         row_label("Skip FMVs", th);
         bool sk = m->s.auto_skip_fmv != 0;
         if (ImGui::Checkbox("##skipfmv", &sk)) launcher_model_toggle_skip_fmv(m);
     }
 
-    if (m->has_turbo_loads) {
-        row_label("Turbo loads", th);
-        bool tl = m->s.turbo_loads != 0;
-        if (ImGui::Checkbox("##turbo", &tl)) launcher_model_toggle_turbo_loads(m);
+    if (m->has_rewind_depth) {
+        row_label("Rewind buffer", th);
+        if (ImGui::Button(launcher_model_rewind_depth_label(m), ImVec2(px(100), px(30))))
+            launcher_model_cycle_rewind_depth(m);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "How many local rewind snapshots to keep (50 / 100 / 150 / 200).\n"
+                "Takes effect on the next launch.");
+        }
+        row_label("Rewind interval", th);
+        if (ImGui::Button(launcher_model_rewind_interval_label(m), ImVec2(px(100), px(30))))
+            launcher_model_cycle_rewind_interval(m);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Frames between rewind snapshots (1 / 4 / 8 / 12 / 15).\n"
+                "FMV still densifies toward 4 when this is sparser.\n"
+                "Takes effect on the next launch.");
+        }
     }
 
-    // HD texture packs (NES module) — same enable + folder row as the legacy
-    // branch renders; kept last, below the console-shape rows.
+    /* Turbo loads is deliberately NOT a Display row on any console. Load
+     * acceleration is owned by the framework's Mods catalog (Fast Loading /
+     * CD Speed), which exposes the multiplier, the instant scheduler and the
+     * distinction between host pacing and drive speed. A single opaque
+     * checkbox here duplicated that at lower fidelity and let the two
+     * surfaces disagree. The has_turbo_loads capability and
+     * Settings.turbo_loads remain in the ABI for hosts that still persist the
+     * value; they simply no longer draw a control. */
+
+    // HD texture packs — toggle plus the ACTIVE pack's name, read-only.
+    //
+    // Unlike the legacy NES row above, there is no folder picker here: which
+    // pack is active is a per-title decision owned by the host's pack manager
+    // (RetComM's Texture Packs modal), which can list installed packs and show
+    // per-pack coverage. A second, blinder picker in this panel could only
+    // fight it — so this panel does the one thing it is better placed to do,
+    // which is flip the pack off and on without leaving the game.
     if (m->hdpack_supported) {
         bool on = m->s.hdpack_enabled != 0;
-        if (ImGui::Checkbox("HD texture pack", &on))
+        if (ImGui::Checkbox("HD textures", &on))
             launcher_model_toggle_hdpack(m);
-        const float bw = px(78);
         ImGui::SameLine(0, px(14));
-        float avail = ImGui::GetContentRegionAvail().x - bw - px(th.spacing_sm);
-        if (avail < px(50)) avail = px(50);
-        const char* dir = m->s.hdpack_dir[0] ? m->s.hdpack_dir : "(not set)";
-        char elided[192]; elide_left(dir, avail, elided, sizeof(elided));
+
+        // Show the pack's folder NAME, not its path: the path is a launcher
+        // data-dir location the player never typed and cannot act on.
+        const char* dir = m->s.hdpack_dir;
+        const char* name = dir;
+        for (const char* c = dir; *c; ++c)
+            if ((*c == '/' || *c == '\\') && c[1]) name = c + 1;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        char elided[192];
+        elide_left(name[0] ? name : "(none selected)", avail, elided, sizeof(elided));
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(col(th.text_muted), "%s", elided);
-        ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw);
-        if (ImGui::Button("Browse", ImVec2(bw, px(30)))) {
-            char buf[512];
-            if (launcher_pick_folder("Select HD pack folder (contains hires.txt)", buf, sizeof(buf)))
-                launcher_model_set_hdpack_dir(m, buf);
-        }
+        if (ImGui::IsItemHovered() && dir[0]) ImGui::SetTooltip("%s", dir);
     }
 }
 
@@ -1951,6 +2822,55 @@ void panel_audio_draw(LauncherModel* m, const LauncherTheme* th) {
     }
 }
 
+// INPUT module: multitap / pad-bus options — half-width card stacked under
+// AUDIO and above SYSTEM in the right column (see draw_settings). Composed
+// for PSX; shown when the title can use multitap seats or the analog hack.
+int avail_input(const LauncherModel* m) {
+    return launcher_model_multitap_available(m) ||
+           launcher_model_multitap_analog_available(m);
+}
+void draw_input_controls(LauncherModel* m, const LauncherTheme& th) {
+    eyebrow("INPUT");
+    if (launcher_model_multitap_available(m)) {
+        bool on = launcher_model_multitap_enabled(m) != 0;
+        if (ImGui::Checkbox("Multitap", &on) &&
+            (on ? 1 : 0) != launcher_model_multitap_enabled(m))
+            launcher_model_toggle_multitap(m);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(px(320));
+            ImGui::TextUnformatted(
+                "Enable SCPH-1070 multitap for 3+ player seats. "
+                "Off limits Play Local to two native controller ports. "
+                "Netplay lobbies with 3 or more players always use multitap.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    }
+    if (launcher_model_multitap_analog_available(m)) {
+        if (launcher_model_multitap_available(m))
+            ImGui::Dummy(ImVec2(0, px(th.spacing_sm)));
+        bool on = launcher_model_multitap_analog_enabled(m) != 0;
+        if (ImGui::Checkbox("Multitap analog (hack)", &on) &&
+            (on ? 1 : 0) != launcher_model_multitap_analog_enabled(m))
+            launcher_model_toggle_multitap_analog(m);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(px(320));
+            ImGui::TextUnformatted(
+                "Allow DualShock sticks on multitap tap seats (not faithful — "
+                "many titles expect digital taps). Saved to game.toml / "
+                "settings. Netplay hosts can enforce this for the lobby.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    }
+}
+void panel_input_draw(LauncherModel* m, const LauncherTheme* th) {
+    if (begin_panel("input", 0)) draw_input_controls(m, *th);
+    end_panel();
+}
+
 // SYSTEM module: BIOS path picker — a half-width card stacked under AUDIO in
 // the right column (see draw_settings), composed only for systems whose
 // profile lists "system" (PSX, GBA) AND only shown for a game instance that
@@ -1959,25 +2879,240 @@ void panel_audio_draw(LauncherModel* m, const LauncherTheme* th) {
 int avail_system(const LauncherModel* m) { return m->has_bios; }
 void draw_system_controls(LauncherModel* m, const LauncherTheme& th) {
     eyebrow("SYSTEM");
+    const SystemProfile* prof = (const SystemProfile*)m->profile;
+    const bool is_gba = prof && prof->id && std::strcmp(prof->id, "gba") == 0;
+    const bool is_psx = prof && prof->id && std::strcmp(prof->id, "psx") == 0;
+    // Empty means "use the BIOS this build ships with" — not "unset". Runtimes
+    // that bundle a redistributable BIOS (PSX/OpenBIOS, GBA) boot straight from
+    // it, so the row states that outcome instead of the old "(default)", which
+    // read as a missing setting the player still had to deal with.
+    const bool has_pick = m->s.bios_path[0] != 0;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(14), px(8)));
+    const float btn_h = px(34);
+    const float browse_w = px(96);
+
+    // Line 1: BIOS label + path + Browse
     row_label("BIOS", th);
-    const float bw = px(78);
-    float avail = ImGui::GetContentRegionAvail().x - bw - px(th.spacing_sm);
+    float avail = ImGui::GetContentRegionAvail().x - browse_w - px(th.spacing_sm);
     if (avail < px(50)) avail = px(50);
-    const char* bp = m->s.bios_path[0] ? m->s.bios_path : "(default)";
+    const char* bp = has_pick ? m->s.bios_path
+                              : (is_gba ? "Retail GBA BIOS required"
+                                        : "OpenBIOS");
     char elided[192]; elide_left(bp, avail, elided, sizeof(elided));
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(col(th.text), "%s", elided);
-    ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw);
-    if (ImGui::Button("Browse", ImVec2(bw, px(28)))) {
-        char buf[512];
-        static const char* kBiosPatterns[] = { "*.bin", "*.rom" };
-        if (launcher_pick_file("Select BIOS file", kBiosPatterns, 2,
-                               "BIOS image (.bin .rom)", buf, sizeof(buf)))
-            launcher_model_set_bios_path(m, buf);
+    ImGui::TextColored(col(has_pick ? th.text : th.text_muted), "%s", elided);
+    ImGui::SameLine(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x -
+                    browse_w);
+    if (ImGui::Button("Browse", ImVec2(browse_w, btn_h))) {
+        request_bios_picker(m,
+                            is_gba ? "Select Game Boy Advance BIOS (gba_bios.bin)"
+                                   : "Select BIOS file",
+                            false);
     }
+
+    // Line 2: secondary action under the path (PSX OpenBIOS / GBA Clear).
+    if (is_psx || has_pick) {
+        const float indent = ImGui::CalcTextSize("BIOS").x + px(th.spacing_md);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+        if (is_psx) {
+            if (!has_pick) ImGui::BeginDisabled();
+            if (ImGui::Button("Use OpenBIOS", ImVec2(0, btn_h)))
+                launcher_model_request_bios_path(m, "");
+            if (!has_pick) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(has_pick
+                                      ? "Switch to bundled OpenBIOS (no rebuild)."
+                                      : "OpenBIOS is already selected.");
+        } else {
+            if (ImGui::Button("Clear", ImVec2(0, btn_h)))
+                launcher_model_request_bios_path(m, "");
+            if (ImGui::IsItemHovered()) {
+                if (is_gba)
+                    ImGui::SetTooltip("Remove this selection. A retail GBA BIOS "
+                                      "is required before the game can launch.");
+                else
+                    ImGui::SetTooltip("Stop using this BIOS and go back to the one "
+                                      "included with this build.");
+            }
+        }
+    }
+
+    /* MotK codegen host: local PGO train under SYSTEM (no separate VIDEO card). */
+    if (is_psx && m->pgo_optimize_with_progress_cb) {
+        ImGui::Dummy(ImVec2(0, px(14)));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                               ImGui::GetContentRegionAvail().x);
+        ImGui::TextColored(col(th.text_muted),
+                           "Train this PC on the intro FMV, then rebuild with "
+                           "profile-guided optimization. Safe for rollback "
+                           "netplay — each peer may optimize independently.");
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, px(8)));
+        const bool can_pgo = m->rom_present && m->rom_full[0] &&
+                             strcmp(m->rom_size, "--") != 0 &&
+                             !m->setup_preparing;
+        if (!can_pgo) ImGui::BeginDisabled();
+        if (ImGui::Button("Optimize FMV Playback", ImVec2(0, btn_h)))
+            launcher_model_request_pgo_optimize(m);
+        if (!can_pgo) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(m->setup_preparing
+                                      ? "A build job is already running."
+                                      : "Select a disc image first.");
+        } else if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Instrument → play intro (~3 min) → rebuild with PGO. "
+                "Uses existing generated C (no setup wizard).");
+        }
+    }
+    ImGui::PopStyleVar();
 }
 void panel_system_draw(LauncherModel* m, const LauncherTheme* th) {
     if (begin_panel("system", 0)) draw_system_controls(m, *th);
+    end_panel();
+}
+
+// SOLAR SENSOR module: a few GBA cartridges carry a photodiode the game reads
+// as gameplay input (Boktai's Gun del Sol charges from real sunlight), so the
+// player has to be able to say WHERE that brightness is measured. Composed only
+// for a system whose profile lists "solar" AND a game that has the hardware.
+//
+// The postal code is edited behind an Edit/Save step, the same shape as the
+// password-save row, so a half-typed code never reaches the host mid-keystroke
+// and the row still shows the working value while editing is abandoned.
+int avail_solar(const LauncherModel* m) { return m->has_solar_sensor; }
+
+void draw_solar_controls(LauncherModel* m, const LauncherTheme& th) {
+    eyebrow("SOLAR SENSOR");
+
+    // Light source first: it decides whether the rest of the card is live.
+    row_label("Light source", th);
+    {
+        const bool manual = m->s.solar_source != 0;
+        const float bw = px(96);
+        ImGui::SameLine(ImGui::GetCursorPosX() +
+                        ImGui::GetContentRegionAvail().x - bw * 2 -
+                        px(th.spacing_sm));
+        if (ImGui::Button(manual ? "Live" : "Live ✓", ImVec2(bw, px(28))))
+            launcher_model_set_solar_source(m, 0);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Read the current sunlight where you are.");
+        ImGui::SameLine(0.0f, px(th.spacing_sm));
+        if (ImGui::Button(manual ? "Fixed ✓" : "Fixed", ImVec2(bw, px(28))))
+            launcher_model_set_solar_source(m, 1);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Hold a chosen level. Makes no network request.");
+    }
+
+    if (m->s.solar_source != 0) {
+        // Fixed level: the location rows below would be inert, so offer the
+        // level instead of greying out three rows the player cannot use.
+        ImGui::Dummy(ImVec2(0, px(4)));
+        row_label("Level", th);
+        int step = m->s.solar_manual_step;
+        const float sw = px(200);
+        ImGui::SameLine(ImGui::GetCursorPosX() +
+                        ImGui::GetContentRegionAvail().x - sw);
+        ImGui::SetNextItemWidth(sw);
+        if (ImGui::SliderInt("##solarlevel", &step, 0, 8, "%d / 8"))
+            launcher_model_set_solar_manual_step(m, step);
+        return;
+    }
+
+    ImGui::Dummy(ImVec2(0, px(4)));
+    row_label("Postal code", th);
+    {
+        static bool s_zip_editing = false;
+        static char s_zip_buf[16];
+        const float bw = px(78);
+        if (!s_zip_editing) {
+            ImGui::AlignTextToFramePadding();
+            const bool set = m->s.solar_zip[0] != 0;
+            ImGui::TextColored(col(set ? th.text : th.text_muted), "%s",
+                               set ? m->s.solar_zip : "(not set — sensor stays dark)");
+            ImGui::SameLine(ImGui::GetCursorPosX() +
+                            ImGui::GetContentRegionAvail().x - bw);
+            if (ImGui::Button("Edit", ImVec2(bw, px(28)))) {
+                snprintf(s_zip_buf, sizeof(s_zip_buf), "%s", m->s.solar_zip);
+                s_zip_editing = true;
+            }
+        } else {
+            float avail = ImGui::GetContentRegionAvail().x - bw * 2 -
+                          px(th.spacing_sm) * 2;
+            if (avail < px(80)) avail = px(80);
+            ImGui::SetNextItemWidth(avail);
+            const bool submitted =
+                ImGui::InputText("##solarzip", s_zip_buf, sizeof(s_zip_buf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine(0, px(th.spacing_sm));
+            if (submitted || ImGui::Button("Save", ImVec2(bw, px(28)))) {
+                launcher_model_set_solar_zip(m, s_zip_buf);
+                s_zip_editing = false;
+            }
+            ImGui::SameLine(0, px(th.spacing_sm));
+            if (ImGui::Button("Cancel", ImVec2(bw, px(28))))
+                s_zip_editing = false;
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, px(4)));
+    row_label("Country", th);
+    {
+        static bool s_cc_editing = false;
+        static char s_cc_buf[8];
+        const float bw = px(78);
+        if (!s_cc_editing) {
+            ImGui::AlignTextToFramePadding();
+            const bool set = m->s.solar_country[0] != 0;
+            ImGui::TextColored(col(set ? th.text : th.text_muted), "%s",
+                               set ? m->s.solar_country : "us");
+            ImGui::SameLine(ImGui::GetCursorPosX() +
+                            ImGui::GetContentRegionAvail().x - bw);
+            if (ImGui::Button("Edit##cc", ImVec2(bw, px(28)))) {
+                snprintf(s_cc_buf, sizeof(s_cc_buf), "%s", m->s.solar_country);
+                s_cc_editing = true;
+            }
+        } else {
+            float avail = ImGui::GetContentRegionAvail().x - bw * 2 -
+                          px(th.spacing_sm) * 2;
+            if (avail < px(60)) avail = px(60);
+            ImGui::SetNextItemWidth(avail);
+            const bool submitted =
+                ImGui::InputText("##solarcc", s_cc_buf, sizeof(s_cc_buf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine(0, px(th.spacing_sm));
+            if (submitted || ImGui::Button("Save##cc", ImVec2(bw, px(28)))) {
+                launcher_model_set_solar_country(m, s_cc_buf);
+                s_cc_editing = false;
+            }
+            ImGui::SameLine(0, px(th.spacing_sm));
+            if (ImGui::Button("Cancel##cc", ImVec2(bw, px(28))))
+                s_cc_editing = false;
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, px(4)));
+    row_label("Full sun", th);
+    {
+        // Clear-sky midday is ~900 W/m^2 at mid latitudes but far less in
+        // winter or at high latitude, where leaving this at 900 would mean the
+        // gauge could never fill on a genuinely sunny day.
+        int wm2 = m->s.solar_full_sun > 0 ? m->s.solar_full_sun : 900;
+        const float sw = px(200);
+        ImGui::SameLine(ImGui::GetCursorPosX() +
+                        ImGui::GetContentRegionAvail().x - sw);
+        ImGui::SetNextItemWidth(sw);
+        if (ImGui::SliderInt("##solarfullsun", &wm2, 300, 1200, "%d W/m²"))
+            launcher_model_set_solar_full_sun(m, wm2);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Irradiance that reads as a full gauge. Lower it "
+                              "in winter or at high latitude.");
+    }
+}
+
+void panel_solar_draw(LauncherModel* m, const LauncherTheme* th) {
+    if (begin_panel("solar", 0)) draw_solar_controls(m, *th);
     end_panel();
 }
 
@@ -1989,7 +3124,11 @@ void panel_system_draw(LauncherModel* m, const LauncherTheme* th) {
 void draw_hotkeys_controls(LauncherModel* m, const LauncherTheme& th) {
     eyebrow("HOTKEYS");
     const SystemProfile* prof = (const SystemProfile*)m->profile;
-    const uint32_t mask = prof ? prof->hotkeys_mask : LNG_HOTKEYS_ALL;
+    uint32_t mask = prof ? prof->hotkeys_mask : LNG_HOTKEYS_ALL;
+    // Solar controls are a per-cartridge capability, not part of the GBA-wide
+    // catalog. They remain absent for every existing game and have no default
+    // binding when the capability is enabled.
+    if (m->has_solar_sensor) mask |= LNG_HOTKEYS_SOLAR;
     // Same responsive grid treatment as the bindings list.
     const float cell_w = px(280.0f);
     int cols = (int)(ImGui::GetContentRegionAvail().x / cell_w);
@@ -2037,12 +3176,10 @@ void panel_hotkeys_draw(LauncherModel* m, const LauncherTheme* th) {
 
 // The settings VIEW composes whichever panels this game's SystemProfile
 // lists in panels_settings, in order: DISPLAY (MAIN) + AUDIO (SIDE) share the
-// top band; SYSTEM (SIDE, PSX/GBA only — its BIOS "Browse" row) then stacks
-// directly beneath AUDIO as a second half-width card in the SAME right
-// column, instead of spanning full width under both columns; any WIDE panels
-// (HOTKEYS) still stack full-width below that — exactly today's fixed layout
-// otherwise, now driven by the composition array + the registry's
-// available() gate instead of hardcoded calls.
+// top band; further SIDE cards (INPUT, SYSTEM, SOLAR, …) then stack under
+// AUDIO in the same right column in composition order; WIDE panels (HOTKEYS)
+// still stack full-width below that — driven by the composition array + the
+// registry's available() gate.
 void draw_settings(LauncherModel* m, const LauncherTheme& th) {
     // Row 1: DISPLAY | AUDIO share the top band. For the legacy minimal
     // surface (no deep caps set — e.g. SNES) both cards are pinned to the
@@ -2066,8 +3203,8 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
 
     const LauncherPanel* video_p   = find_composed(prof->panels_settings, "video", m);
     const LauncherPanel* audio_p   = find_composed(prof->panels_settings, "audio", m);
-    const LauncherPanel* system_p  = find_composed(prof->panels_settings, "system", m);
     const LauncherPanel* hotkeys_p = find_composed(prof->panels_settings, "hotkeys", m);
+    const bool psx_settings = prof && prof->id && std::strcmp(prof->id, "psx") == 0;
 
     // Left content edge in SCREEN space — where DISPLAY starts and where any
     // full-width content (HOTKEYS) below both columns must resume.
@@ -2082,11 +3219,10 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
         left_bottom = ImGui::GetItemRectMax().y;
     }
     if (video_p && audio_p) ImGui::SameLine(0, gap);
-    // Capture the right column's SCREEN x BEFORE opening AUDIO's child, so a
-    // SYSTEM card composed alongside it (SIDE slot — see kPanelRegistry) can
-    // be reopened at the same x once AUDIO's child ends (a finished child,
-    // like any item, returns the cursor to the LEFT edge of the row on the
-    // next line, not to its own column).
+    // Capture the right column's SCREEN x BEFORE opening AUDIO's child, so
+    // additional SIDE cards (INPUT/SYSTEM/…) can reopen at the same x once
+    // AUDIO's child ends (a finished child returns the cursor to the LEFT
+    // edge of the row on the next line, not to its own column).
     const float right_x = ImGui::GetCursorScreenPos().x;
     float audio_bottom = 0.0f;   // AUDIO's bottom edge (screen space)
     if (audio_p) {
@@ -2097,34 +3233,277 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
         audio_bottom = ImGui::GetItemRectMax().y;
     }
 
-    // SYSTEM (PSX/GBA's BIOS row) is a SIDE-slot card: stack it as a second
-    // half-width card directly under AUDIO, in the same right column, rather
-    // than spanning the full width below both columns. Falls back to full
-    // width only if some profile composes "system" without "audio".
-    if (system_p) {
-        if (audio_p) {
-            // Place SYSTEM's top edge one standard card-gap below AUDIO's
-            // bottom edge specifically (not "wherever the taller of the two
-            // columns ended up", which is what plain SameLine/next-line flow
-            // would give — DISPLAY's deep surface is usually taller than
-            // AUDIO, and that gap would show as dead space above SYSTEM).
-            ImGui::SetCursorScreenPos(ImVec2(right_x, audio_bottom + gap));
-            begin_container("set_r2", ImVec2(half, 0), ImGuiChildFlags_AutoResizeY);
-            system_p->draw(m, &th);
-            end_container();
-            const float system_bottom = ImGui::GetItemRectMax().y;
-            // The manual SetCursorScreenPos above pulled SYSTEM out of the
-            // normal same-line row flow, so ImGui's auto-advanced cursor now
-            // only accounts for SYSTEM's own bottom, not DISPLAY's (which can
-            // still be the taller column). Explicitly resume the layout below
-            // whichever column is taller so HOTKEYS never overlaps DISPLAY.
-            const float below_y = (left_bottom > system_bottom) ? left_bottom : system_bottom;
-            ImGui::SetCursorScreenPos(ImVec2(content_left_x, below_y + gap));
-        } else {
-            system_p->draw(m, &th);
+    // Remaining SIDE-slot cards (INPUT, SYSTEM, SOLAR, …) stack under AUDIO
+    // in panels_settings order. Falls back to full width only if a profile
+    // composes them without "audio".
+    float stack_bottom = audio_bottom;
+    bool stacked_side = false;
+    bool stacked_hotkeys = false;
+    if (prof->panels_settings) {
+        for (int i = 0; prof->panels_settings[i]; ++i) {
+            const char* id = prof->panels_settings[i];
+            if (!id || !id[0]) continue;
+            if (strcmp(id, "video") == 0 || strcmp(id, "audio") == 0 ||
+                (!psx_settings && strcmp(id, "hotkeys") == 0))
+                continue;
+            const LauncherPanel* side_p =
+                find_composed(prof->panels_settings, id, m);
+            const bool force_side_hotkeys =
+                psx_settings && strcmp(id, "hotkeys") == 0;
+            if (!side_p ||
+                (side_p->slot != LNG_SLOT_SIDE && !force_side_hotkeys))
+                continue;
+            if (audio_p) {
+                ImGui::SetCursorScreenPos(
+                    ImVec2(right_x, stack_bottom + gap));
+                char cname[48];
+                snprintf(cname, sizeof(cname), "set_r_%s", id);
+                begin_container(cname, ImVec2(half, 0),
+                                ImGuiChildFlags_AutoResizeY);
+                side_p->draw(m, &th);
+                end_container();
+                stack_bottom = ImGui::GetItemRectMax().y;
+                stacked_side = true;
+                if (force_side_hotkeys)
+                    stacked_hotkeys = true;
+            } else {
+                side_p->draw(m, &th);
+                stack_bottom = ImGui::GetItemRectMax().y;
+                stacked_side = true;
+                if (force_side_hotkeys)
+                    stacked_hotkeys = true;
+            }
         }
     }
-    if (hotkeys_p) hotkeys_p->draw(m, &th);
+    if (stacked_side && audio_p) {
+        // Manual SetCursorScreenPos pulled SIDE cards out of row flow — resume
+        // below the taller column so HOTKEYS never overlaps DISPLAY.
+        const float below_y =
+            (left_bottom > stack_bottom) ? left_bottom : stack_bottom;
+        ImGui::SetCursorScreenPos(ImVec2(content_left_x, below_y + gap));
+    }
+    if (hotkeys_p && !stacked_hotkeys) hotkeys_p->draw(m, &th);
+}
+
+static bool enabled_camera_controls(const LauncherModel* m) {
+    const auto* mods = m ? m->mods : nullptr;
+    if (!mods || !mods->feature_count || !mods->feature_get) return false;
+    const int count = mods->feature_count(mods->ctx);
+    for (int index = 0; index < count; ++index) {
+        RecompLauncherCModFeature feature{};
+        if (mods->feature_get(mods->ctx, index, &feature) &&
+            feature.enabled && feature.camera_controls)
+            return true;
+    }
+    return false;
+}
+
+const char* settings_key_label(int scancode) {
+    if (scancode <= 0) return "(unbound)";
+    const char* name = SDL_GetScancodeName((SDL_Scancode)scancode);
+    return (name && name[0]) ? name : "(unbound)";
+}
+
+static const char* settings_pad_button_label(int code) {
+    const char* name = SDL_GetGamepadStringForButton((LNG_GamepadButton)code);
+    if (!name || !name[0]) return "button";
+    if (!std::strcmp(name, "back")) return "select";
+    if (!std::strcmp(name, "leftstick")) return "l3";
+    if (!std::strcmp(name, "rightstick")) return "r3";
+    if (!std::strcmp(name, "leftshoulder")) return "l1";
+    if (!std::strcmp(name, "rightshoulder")) return "r1";
+    return name;
+}
+
+static bool settings_pad_button_is_select(int code) {
+    return std::strcmp(settings_pad_button_label(code), "select") == 0;
+}
+
+static int button_mask_count(uint32_t mask) {
+    int n = 0;
+    while (mask) {
+        n += (int)(mask & 1u);
+        mask >>= 1;
+    }
+    return n;
+}
+
+void settings_pad_label(int binding, char* out, size_t capacity) {
+    if (!out || !capacity) return;
+    const char* name = nullptr;
+    char text[96] = {};
+    if (RECOMP_LAUNCHER_PAD_IS_BUTTON(binding)) {
+        int code = RECOMP_LAUNCHER_PAD_BUTTON_CODE(binding);
+        snprintf(text, sizeof text, "%s", settings_pad_button_label(code));
+    } else if (RECOMP_LAUNCHER_PAD_IS_AXIS(binding)) {
+        int code = RECOMP_LAUNCHER_PAD_AXIS_CODE(binding);
+        name = SDL_GetGamepadStringForAxis((LNG_GamepadAxis)code);
+        snprintf(text, sizeof text, "%s%c",
+                 (name && name[0]) ? name : "axis",
+                 RECOMP_LAUNCHER_PAD_AXIS_POSITIVE(binding) ? '+' : '-');
+    } else if (RECOMP_LAUNCHER_PAD_IS_BUTTON_COMBO(binding)) {
+        uint32_t mask = (uint32_t)RECOMP_LAUNCHER_PAD_BUTTON_COMBO_MASK(binding);
+        for (int code = 0; code < 32; ++code) {
+            if ((mask & ((uint32_t)1u << code)) == 0)
+                continue;
+            if (text[0])
+                strncat(text, " + ", sizeof(text) - strlen(text) - 1);
+            strncat(text, settings_pad_button_label(code),
+                    sizeof(text) - strlen(text) - 1);
+        }
+        if (!text[0])
+            snprintf(text, sizeof text, "(unbound)");
+    } else {
+        snprintf(text, sizeof text, "(unbound)");
+    }
+    snprintf(out, capacity, "%s", text);
+}
+
+void draw_assist_binding_editor(LauncherModel* m, const LauncherTheme& th,
+                                const char* table_id, int action_limit,
+                                bool show_reset) {
+    if (!m->settings_bindings || m->assist_binding_count <= 0 ||
+        !m->assist_binding_labels)
+        return;
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.accent2));
+    ImGui::TextUnformatted(m->has_assist_tools ? "ASSIST CONTROLS" : "HOST SHORTCUTS");
+    ImGui::PopStyleColor();
+    ImGui::TextColored(
+        col(th.text_muted),
+        m->has_assist_tools
+            ? "Global controls; they only operate while Assist Tools is enabled."
+            : "Press a controller button or chord.");
+    if (ImGui::BeginTable(table_id, 3, ImGuiTableFlags_SizingFixedFit |
+                                      ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed,
+                                px(150));
+        ImGui::TableSetupColumn("Keyboard", ImGuiTableColumnFlags_WidthFixed,
+                                px(180));
+        ImGui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthFixed,
+                                px(180));
+        ImGui::TableHeadersRow();
+        int count = m->assist_binding_count;
+        if (action_limit > 0 && count > action_limit) count = action_limit;
+        for (int action = 0; action < count; ++action) {
+            ImGui::PushID(action);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(m->assist_binding_labels[action]);
+            ImGui::TableSetColumnIndex(1);
+            bool capture_key = m->capturing && m->capture_assist &&
+                               !m->capture_pad && m->capture_btn == action;
+            if (ImGui::Button(
+                    capture_key ? "[ press a key... ]" :
+                        settings_key_label(m->s.assist_key_bind[action]),
+                    ImVec2(px(170), 0)))
+                launcher_model_begin_assist_capture(m, action, false);
+            ImGui::TableSetColumnIndex(2);
+            bool capture_pad = m->capturing && m->capture_assist &&
+                               m->capture_pad && m->capture_btn == action;
+            char pad[48];
+            settings_pad_label(m->s.assist_pad_bind[action], pad, sizeof pad);
+            if (ImGui::Button(
+                    capture_pad ? "[ press a button... ]" : pad,
+                    ImVec2(px(170), 0)))
+                launcher_model_begin_assist_capture(m, action, true);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (show_reset && ImGui::Button(m->has_assist_tools
+                                        ? "Reset Assist Controls"
+                                        : "Reset Host Shortcuts"))
+        launcher_model_reset_assist_bindings(m);
+    if (m->capturing && m->capture_assist)
+        ImGui::TextColored(col(th.warn), "Listening... (Esc cancels)");
+}
+
+void draw_controller_assist_shortcuts(LauncherModel* m,
+                                      const LauncherTheme& th) {
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.accent2));
+    ImGui::TextUnformatted(m->has_assist_tools ? "ASSIST SHORTCUTS" : "HOST SHORTCUTS");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextColored(col(th.text_muted),
+                       m->has_assist_tools
+                           ? "(global; requires Assist Tools)"
+                           : "(button chords supported)");
+    if (ImGui::BeginTable("controller_assist_binds", 2,
+                          ImGuiTableFlags_SizingStretchSame)) {
+        for (int action = 0;
+             action < m->assist_binding_count && action < 2; ++action) {
+            ImGui::TableNextColumn();
+            ImGui::PushID(action);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(m->assist_binding_labels[action]);
+            ImGui::SameLine(0, px(8));
+            if (m->has_assist_tools) {
+                bool capture_key = m->capturing && m->capture_assist &&
+                                   !m->capture_pad && m->capture_btn == action;
+                if (ImGui::Button(
+                        capture_key ? "[ key... ]" :
+                            settings_key_label(m->s.assist_key_bind[action]),
+                        ImVec2(px(105), 0)))
+                    launcher_model_begin_assist_capture(m, action, false);
+                ImGui::SameLine(0, px(5));
+            }
+            bool capture_pad = m->capturing && m->capture_assist &&
+                               m->capture_pad && m->capture_btn == action;
+            char pad[48];
+            settings_pad_label(m->s.assist_pad_bind[action], pad, sizeof pad);
+            if (ImGui::Button(capture_pad ? "[ button... ]" : pad,
+                              ImVec2(px(m->has_assist_tools ? 135 : 170), 0)))
+                launcher_model_begin_assist_capture(m, action, true);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (m->capturing && m->capture_assist)
+        ImGui::TextColored(col(th.warn), "Listening... (Esc cancels)");
+}
+
+void draw_assist_tools(LauncherModel* m, const LauncherTheme& th) {
+    if (!begin_panel("assist_tools_page", 0, false)) {
+        end_panel();
+        return;
+    }
+    eyebrow("ASSIST TOOLS / CHEATS");
+    bool enabled = m->s.assist_tools != 0;
+    if (ImGui::Checkbox("Enable Assist Tools / Cheats", &enabled))
+        m->s.assist_tools = enabled ? 1 : 0;
+    ImGui::Dummy(ImVec2(0, px(6)));
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+    ImGui::PushTextWrapPos();
+    ImGui::TextWrapped("%s",
+        (m->assist_tools_note && m->assist_tools_note[0])
+            ? m->assist_tools_note
+            : "This optional host mode enables game-specific convenience "
+              "features. The game window should disclose when it is active.");
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    if (m->settings_bindings) {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        draw_assist_binding_editor(m, th, "assist_binds", 0, true);
+    }
+    end_panel();
+}
+
+void draw_credits(LauncherModel* m, const LauncherTheme& th) {
+    if (!begin_panel("credits_page", 0, false)) {
+        end_panel();
+        return;
+    }
+    eyebrow("CREDITS");
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text));
+    ImGui::PushTextWrapPos();
+    ImGui::TextWrapped("%s",
+        (m->credits_text && m->credits_text[0])
+            ? m->credits_text
+            : "Credits have not been supplied for this title.");
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    end_panel();
 }
 
 // CONTROLLER-view rebind page: input source + deadzone, and the keyboard
@@ -2135,6 +3514,12 @@ void draw_settings(LauncherModel* m, const LauncherTheme& th) {
 // Circle/Cross/Square/L1/L2/R1/R2/L3/R3/...) instead of a hardcoded SNES set.
 void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
     const int p = m->cfg_player;
+    const SystemProfile* cfg_prof = (const SystemProfile*)m->profile;
+    const bool cfg_psx = cfg_prof && cfg_prof->id && !strcmp(cfg_prof->id, "psx");
+    if (cfg_psx && m->s.player_src[p] == 2 &&
+        m->s.player_gamepad_guid[p][0] && !m->player_pad_name[p][0])
+        launcher_binds_hydrate_psx_pad_names(m);
+
     if (begin_panel("cfg_src", 0)) {
         ImGui::PushStyleColor(ImGuiCol_Text, col(th.accent2));
         ImGui::Text("CONTROLLER - PLAYER %d", p + 1); ImGui::PopStyleColor(); ImGui::Spacing();
@@ -2143,6 +3528,58 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
         if (ImGui::BeginCombo("##csrc", launcher_model_player_src_label(m, p))) {
             draw_source_selectables(m, p);
             ImGui::EndCombo();
+        }
+        if (cfg_psx) {
+            static bool s_rename_open = false;
+            static char s_rename_buf[64] = {};
+            const bool can_pad = m->s.player_src[p] == 2 &&
+                                 m->s.player_gamepad_guid[p][0];
+            ImGui::SameLine();
+            if (!can_pad) ImGui::BeginDisabled();
+            if (ImGui::Button("Rename Gamepad")) {
+                std::snprintf(s_rename_buf, sizeof(s_rename_buf), "%s",
+                              m->player_pad_name[p]);
+                s_rename_open = true;
+            }
+            if (!can_pad) ImGui::EndDisabled();
+
+            // Delete sits on the right of the Input source row.
+            {
+                const float del_w = px(130.0f);
+                const float right = ImGui::GetWindowContentRegionMax().x;
+                ImGui::SameLine(right - del_w);
+                if (!can_pad) ImGui::BeginDisabled();
+                if (ImGui::Button("Delete Gamepad", ImVec2(del_w, 0)))
+                    launcher_binds_delete_psx_gamepad(m, p + 1);
+                if (!can_pad) ImGui::EndDisabled();
+            }
+
+            if (s_rename_open) ImGui::OpenPopup("Rename Gamepad");
+            ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+            ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            if (ImGui::BeginPopupModal("Rename Gamepad", &s_rename_open,
+                                       ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted("Display name for this gamepad:");
+                ImGui::SetNextItemWidth(px(320));
+                bool enter = ImGui::InputText(
+                    "##rename_pad", s_rename_buf, sizeof(s_rename_buf),
+                    ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::Spacing();
+                if (ImGui::Button("Cancel", ImVec2(px(120), 0))) {
+                    s_rename_open = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                const bool ok = s_rename_buf[0] != '\0';
+                ImGui::BeginDisabled(!ok);
+                if ((ImGui::Button("OK", ImVec2(px(120), 0)) || enter) && ok) {
+                    launcher_binds_rename_psx_gamepad(m, p + 1, s_rename_buf);
+                    s_rename_open = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndDisabled();
+                ImGui::EndPopup();
+            }
         }
         row_label("Deadzone", th);
         int dz = 0; stepper("dz", m->s.deadzone[p], "%", &dz);
@@ -2208,6 +3645,178 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
         } end_panel();
     }
 
+    // MOTION card (opt-in): the host owns controller discovery and axis
+    // mapping; recomp-ui owns only the portable sensitivity setting.
+    if (m->has_gyro_controls && p == 0) {
+        if (begin_panel("cfg_motion", 0)) {
+            eyebrow("MOTION");
+            row_label("Gyro sensitivity", th);
+            ImGui::SetNextItemWidth(px(200));
+            float sens = m->s.gyro_sensitivity;
+            if (ImGui::SliderFloat("##gyrosens", &sens, 0.25f, 4.00f, "%.2fx"))
+                launcher_model_set_gyro_sensitivity(m, sens);
+
+            // Prefer the explicitly selected Player 1 pad; while the source
+            // is still Keyboard, preview the first connected gyro-capable pad
+            // so motion can be verified before changing the source dropdown.
+            const LauncherPad* motion_pad = nullptr;
+            if (m->s.player_src[p] == 2) {
+                for (int i = 0; i < g_pad_count; ++i) {
+                    const bool id_match =
+                        m->player_pad_id[p] &&
+                        g_pads[i].id == m->player_pad_id[p];
+                    const bool guid_match =
+                        m->s.player_gamepad_guid[p][0] &&
+                        g_pads[i].guid[0] &&
+                        std::strcmp(m->s.player_gamepad_guid[p],
+                                    g_pads[i].guid) == 0;
+                    if (id_match || guid_match) {
+                        motion_pad = &g_pads[i];
+                        break;
+                    }
+                }
+            }
+
+            const float rate = motion_pad && motion_pad->has_gyro
+                                 ? motion_pad->gyro_z : 0.0f;
+            // Match gbarecomp's PC mapping exactly: negate face-normal Z,
+            // apply the gentler 128-units/rad/s DualSense base gain, then the
+            // launcher multiplier, and clamp to the cartridge's +/-0x600.
+            const float cartridge = std::clamp(
+                -rate * 128.0f * m->s.gyro_sensitivity,
+                -1536.0f, 1536.0f);
+            const float level = cartridge / 1536.0f;
+
+            ImGui::Spacing();
+            ImGui::TextUnformatted(
+                motion_pad
+                    ? (motion_pad->has_gyro
+                           ? motion_pad->name
+                           : "Selected controller has no gyro sensor")
+                    : "No gyro controller detected");
+
+            // Centered live gauge. The moving needle and colored fill show the
+            // exact signed value the host will send to the cartridge; reaching
+            // either edge means the configured sensitivity is saturating.
+            const float meter_w = std::min(px(360.0f),
+                                           ImGui::GetContentRegionAvail().x);
+            const ImVec2 meter_min = ImGui::GetCursorScreenPos();
+            const ImVec2 meter_max(meter_min.x + meter_w,
+                                   meter_min.y + px(26.0f));
+            ImGui::InvisibleButton("##gyro_meter",
+                                   ImVec2(meter_w, px(26.0f)));
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(meter_min, meter_max, imcol(th.control),
+                              px(th.radius_sm));
+            dl->AddRect(meter_min, meter_max, imcol(th.border),
+                        px(th.radius_sm));
+            const float center = (meter_min.x + meter_max.x) * 0.5f;
+            for (int tick = -2; tick <= 2; ++tick) {
+                const float x = center + tick * meter_w * 0.20f;
+                dl->AddLine(ImVec2(x, meter_min.y + px(7.0f)),
+                            ImVec2(x, meter_max.y - px(7.0f)),
+                            imcol(tick == 0 ? th.text_muted : th.border),
+                            tick == 0 ? px(2.0f) : px(1.0f));
+            }
+            const float needle = center + level * meter_w * 0.5f;
+            if (level != 0.0f) {
+                dl->AddRectFilled(
+                    ImVec2(std::min(center, needle), meter_min.y + px(9.0f)),
+                    ImVec2(std::max(center, needle), meter_max.y - px(9.0f)),
+                    imcol(th.accent), px(3.0f));
+            }
+            dl->AddLine(ImVec2(needle, meter_min.y + px(3.0f)),
+                        ImVec2(needle, meter_max.y - px(3.0f)),
+                        imcol(motion_pad && motion_pad->has_gyro
+                                  ? th.good : th.warn),
+                        px(3.0f));
+            ImGui::Text("Output %+.0f / 1536   Sensor %+.2f rad/s",
+                        cartridge, rate);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+            ImGui::TextWrapped(
+                "A compatible controller motion sensor is used automatically. "
+                "Mouse drag remains available as a fallback.");
+            ImGui::PopStyleColor();
+        } end_panel();
+    }
+
+    /* Voxel/3D camera bindings are feature-driven, not a permanent NES
+     * capability. The card appears only while at least one enabled feature
+     * advertises camera_controls, and only on Player 1's page because the
+     * presentation camera is global. */
+    if (p == 0 && enabled_camera_controls(m)) {
+        static const char* kActionLabels[LNG_CAMERA_BIND_COUNT] = {
+            "Look up", "Look down", "Look left", "Look right",
+            "Roll left", "Roll right", "Zoom in", "Zoom out",
+            "Sprites smaller", "Sprites larger", "Reset view",
+            "Toggle Voxel 3D",
+        };
+        static const char* kPadDefaults[LNG_CAMERA_BIND_COUNT] = {
+            "Right stick up", "Right stick down",
+            "Right stick left", "Right stick right",
+            "-", "-", "-", "-", "-", "-", "-", "-",
+        };
+        launcher_binds_refresh_camera(m);
+        if (begin_panel("cfg_camera", 0)) {
+            eyebrow("3D CAMERA");
+            ImGui::TextColored(
+                col(th.text_muted),
+                "Active while the enabled Voxel mod is running. Right-stick "
+                "look is the gamepad default; keyboard actions use the numpad.");
+            ImGui::Spacing();
+            if (ImGui::BeginTable(
+                    "camera_binds", 3,
+                    ImGuiTableFlags_SizingStretchProp |
+                    ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Action",
+                                        ImGuiTableColumnFlags_WidthStretch,
+                                        1.2f);
+                ImGui::TableSetupColumn("Keyboard",
+                                        ImGuiTableColumnFlags_WidthStretch,
+                                        1.0f);
+                ImGui::TableSetupColumn("Gamepad default",
+                                        ImGuiTableColumnFlags_WidthStretch,
+                                        1.0f);
+                ImGui::TableHeadersRow();
+                for (int action = 0; action < LNG_CAMERA_BIND_COUNT;
+                     ++action) {
+                    ImGui::PushID(action);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(kActionLabels[action]);
+                    ImGui::TableSetColumnIndex(1);
+                    const bool capturing =
+                        m->camera_capturing &&
+                        m->capture_camera == action;
+                    if (capturing)
+                        ImGui::PushStyleColor(
+                            ImGuiCol_Button, col(th.accent));
+                    if (ImGui::Button(
+                            capturing ? "[ press a key... ]"
+                                      : m->camera_binds[action],
+                            ImVec2(-FLT_MIN, 0)))
+                        launcher_model_begin_camera_capture(m, action);
+                    if (capturing) ImGui::PopStyleColor();
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(
+                        col(th.text_muted), "%s",
+                        kPadDefaults[action]);
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::Spacing();
+            if (ImGui::Button("Reset Camera Bindings"))
+                launcher_binds_reset_camera(m);
+            if (m->camera_capturing)
+                ImGui::TextColored(
+                    col(th.warn), "Listening... (Esc cancels)");
+        } end_panel();
+    }
+
     // Some systems ship no rebindable input layer (N64 Snap / PMS-J read no
     // input.cfg): GameInfo.hide_rebind drops the bindings card entirely and the
     // Controller view is source+deadzone only.
@@ -2218,9 +3827,122 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
         // (1..4) instead of one tall column with dead space to the right.
         const SystemProfile* prof = (const SystemProfile*)m->profile;
         const ControllerSpec& spec = prof->controller;
-        // Alternate binds per input (N64's input.cfg keeps two; SNES/PSX/GBA
+        const bool is_psx = prof && prof->id && !strcmp(prof->id, "psx");
+
+        // ---- PSX: Gamepad Bindings (per selected SDL GUID) -----------------
+        // Replaces the keyboard grid on Configure. Column-major layout
+        // (top→bottom then next column) matching kPsxGamepadBindOrder.
+        if (is_psx) {
+            ImGui::PushStyleColor(ImGuiCol_Text, col(th.accent2));
+            ImGui::Text("GAMEPAD BINDINGS - PLAYER %d", p + 1);
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+
+            const bool has_pad_src = m->s.player_src[p] == 2 &&
+                                     m->s.player_gamepad_guid[p][0];
+            if (!has_pad_src) {
+                ImGui::TextColored(col(th.text_muted),
+                    "Select a gamepad as Input source to configure bindings.");
+            } else {
+                float label_col_w = px(90.0f);
+                for (int i = 0; i < LNG_PSX_PAD_BUTTON_COUNT; ++i) {
+                    float w = ImGui::CalcTextSize(spec.buttons[i].label).x + px(20.0f);
+                    if (w > label_col_w) label_col_w = w;
+                }
+                const float chip_w = px(140.0f);
+                const float cell_w = label_col_w + chip_w + px(16.0f);
+                if (ImGui::BeginTable("psx_pad_binds", LNG_PSX_GAMEPAD_BIND_COLS,
+                                      ImGuiTableFlags_SizingFixedFit)) {
+                    for (int c = 0; c < LNG_PSX_GAMEPAD_BIND_COLS; ++c)
+                        ImGui::TableSetupColumn(nullptr,
+                            ImGuiTableColumnFlags_WidthFixed, cell_w);
+                    for (int row = 0; row < LNG_PSX_GAMEPAD_BIND_ROWS; ++row) {
+                        for (int c = 0; c < LNG_PSX_GAMEPAD_BIND_COLS; ++c) {
+                            const int order_i = c * LNG_PSX_GAMEPAD_BIND_ROWS + row;
+                            const int b = kPsxGamepadBindOrder[order_i];
+                            ImGui::TableNextColumn();
+                            ImGui::PushID(b);
+                            ImGui::AlignTextToFramePadding();
+                            ImGui::TextColored(col(th.text_muted), "%s",
+                                               spec.buttons[b].label);
+                            ImGui::SameLine(label_col_w);
+                            const bool cap = m->capturing && m->capture_pad &&
+                                             m->capture_btn == b;
+                            const bool wait_rel = cap && m->map_all_wait_release;
+                            const char* pl = m->pad_binds[p][b][0]
+                                               ? m->pad_binds[p][b]
+                                               : "(unbound)";
+                            if (cap) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
+                            const char* chip = wait_rel ? "[ release button... ]"
+                                              : cap     ? "[ press a button... ]"
+                                                        : pl;
+                            if (ImGui::Button(chip, ImVec2(chip_w, 0))) {
+                                m->map_all_active = false;
+                                m->map_all_wait_release = false;
+                                launcher_model_begin_pad_capture(m, b);
+                                // If they start a bind while still holding the
+                                // prior input, wait for a full release first.
+                                if (m->capturing && m->player_pad_id[p] &&
+                                    !launcher_input_gamepad_at_rest(
+                                        m->player_pad_id[p]))
+                                    m->map_all_wait_release = true;
+                            }
+                            if (cap) ImGui::PopStyleColor();
+                            ImGui::PopID();
+                        }
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::Spacing();
+                if (ImGui::Button("Map All Bindings")) {
+                    launcher_model_begin_map_all(m);
+                    if (m->capturing && m->player_pad_id[p] &&
+                        !launcher_input_gamepad_at_rest(m->player_pad_id[p]))
+                        m->map_all_wait_release = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset to Defaults"))
+                    launcher_binds_reset_player(m, m->cfg_player + 1);
+                // Save Profile — name, choice, mappings, and deadzone for this GUID.
+                static double s_profile_saved_until = 0.0;
+                {
+                    const float save_w = px(120.0f);
+                    const float right = ImGui::GetWindowContentRegionMax().x;
+                    ImGui::SameLine(right - save_w);
+                    if (ImGui::Button("Save Profile", ImVec2(save_w, 0))) {
+                        launcher_binds_save_psx_gamepad(m, p + 1);
+                        s_profile_saved_until = ImGui::GetTime() + 2.5;
+                    }
+                }
+                if (m->capturing && m->capture_pad) {
+                    const char* label =
+                        (m->capture_btn >= 0 &&
+                         m->capture_btn < LNG_PSX_PAD_BUTTON_COUNT)
+                            ? spec.buttons[m->capture_btn].label : "?";
+                    if (m->map_all_wait_release) {
+                        ImGui::TextColored(col(th.warn),
+                            "Release Button (Esc cancels)%s",
+                            m->map_all_active ? " — Map All" : "");
+                    } else {
+                        ImGui::TextColored(col(th.warn),
+                            "Map an input to %s (Esc cancels)%s",
+                            label,
+                            m->map_all_active ? " — Map All" : "");
+                    }
+                }
+                if (ImGui::GetTime() < s_profile_saved_until)
+                    ImGui::TextColored(col(th.accent2), "Input Profile Saved!");
+            }
+        } else {
+        // Alternate binds per input (N64's input.cfg keeps two; SNES/GBA
         // keep one). 0 in the spec reads as 1 (older positional initializers).
-        const int bpi = spec.binds_per_input < 1 ? 1 : spec.binds_per_input;
+        // Host-owned settings arrays have one keyboard and one controller
+        // value per action, independent of a console bridge's alternate-slot
+        // format (for example N64 input.cfg). Keep that opt-in store on its
+        // own two-chip path instead of accidentally editing the native store.
+        const bool settings_player_binds = m->settings_bindings && !cfg_psx;
+        const int bpi = settings_player_binds
+            ? 1 : (spec.binds_per_input < 1 ? 1 : spec.binds_per_input);
 
         // Stores that follow the input SOURCE (N64: one shared table per device
         // TYPE) must re-read display strings on entry so switching
@@ -2232,7 +3954,7 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
         // A pad-bind console (Genesis) offers a KEY chip AND a GAMEPAD chip per
         // row — the legacy launcher's "Set key" / "Set pad" pair. Otherwise the
         // grid is keyboard-only, exactly as before.
-        const bool has_pad = spec.has_pad_binds != 0;
+        const bool has_pad = spec.has_pad_binds != 0 || settings_player_binds;
 
         // When the player's source is a gamepad the N64 store captures pad
         // fields, not keys — reflect that in the card title and the capture
@@ -2264,7 +3986,7 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
         // (bpi>=2) OR a pad-bind console pairs a KEY + GAMEPAD chip (has_pad);
         // narrower chips then. Single-chip cells keep the wider chip AND the
         // exact legacy cell width (label + 170) so non-pad/single-bind consoles
-        // (SNES/PSX/GBA) pack columns byte-identically to before this existed.
+        // (SNES/GBA) pack columns byte-identically to before this existed.
         const bool two_chip = (bpi >= 2) || has_pad;
         const float chip_w   = two_chip ? px(118.0f) : px(160.0f);
         const float chip_gap = px(6.0f);
@@ -2308,7 +4030,10 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
                     // KEY chip
                     const bool cap_key = m->capturing && !m->capture_pad && m->capture_btn == b;
                     if (cap_key) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
-                    if (ImGui::Button(cap_key ? "[ press a key... ]" : m->binds[p][b], ImVec2(chip_w, 0)))
+                    const char* key_text = settings_player_binds
+                        ? settings_key_label(m->s.player_key_bind[p][b])
+                        : m->binds[p][b];
+                    if (ImGui::Button(cap_key ? "[ press a key... ]" : key_text, ImVec2(chip_w, 0)))
                         launcher_model_begin_capture(m, b);
                     if (cap_key) ImGui::PopStyleColor();
                     // GAMEPAD chip (pad-bind consoles only: Genesis)
@@ -2316,7 +4041,13 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
                         ImGui::SameLine(0, chip_gap);
                         ImGui::PushID("pad");
                         const bool cap_pad = m->capturing && m->capture_pad && m->capture_btn == b;
-                        const char* pl = m->pad_binds[p][b][0] ? m->pad_binds[p][b] : "(unbound)";
+                        char settings_pad[48];
+                        settings_pad_label(m->s.player_pad_bind[p][b],
+                                           settings_pad, sizeof settings_pad);
+                        const char* pl = settings_player_binds
+                            ? settings_pad
+                            : (m->pad_binds[p][b][0]
+                                ? m->pad_binds[p][b] : "(unbound)");
                         if (cap_pad) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
                         if (ImGui::Button(cap_pad ? "[ press a button... ]" : pl, ImVec2(chip_w, 0)))
                             launcher_model_begin_pad_capture(m, b);
@@ -2329,8 +4060,14 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
             ImGui::EndTable();
         }
         ImGui::Spacing();
-        if (ImGui::Button("Reset to Defaults")) launcher_binds_reset_player(m, m->cfg_player + 1);
+        if (ImGui::Button("Reset to Defaults")) {
+            if (settings_player_binds)
+                launcher_model_reset_player_bindings(m, m->cfg_player);
+            else
+                launcher_binds_reset_player(m, m->cfg_player + 1);
+        }
         if (m->capturing) ImGui::TextColored(col(th.warn), "Listening... (Esc cancels)");
+        } // !is_psx
     } end_panel();
 
     // Zapper (light gun) block — NES Zapper games only (gi.zapper). The mouse
@@ -2351,6 +4088,12 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
             bool ch = m->zapper_crosshair;
             if (ImGui::Checkbox("Show crosshair (hides the OS cursor)", &ch))
                 launcher_model_toggle_zapper_crosshair(m);
+        } end_panel();
+    }
+
+    if (m->settings_bindings) {
+        if (begin_panel("cfg_assist_binds", 0)) {
+            draw_controller_assist_shortcuts(m, th);
         } end_panel();
     }
 }
@@ -2404,18 +4147,43 @@ void np_connect_and_list(LauncherModel* m) {
     if (!np) return;
     if (np->set_player_name && m->s.netplay_player_name[0])
         np->set_player_name(np->ctx, m->s.netplay_player_name);
-    if (np->connect && (!np->connected || !np->connected(np->ctx)))
+    const bool already = np->connected && np->connected(np->ctx);
+    const bool in_flight = np->connecting && np->connecting(np->ctx);
+    if (np->connect && !already && !in_flight)
         (void)np->connect(np->ctx);
     if (np->request_list)
         np->request_list(np->ctx);
     m->netplay_list_fresh = true;
+    if (!already)
+        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                      "Connecting to lobby server…");
 }
 
-/* Reload server lobby table + rescan local LAN registry / probes. */
+/* Reload server lobby table + UDP-browse LAN hosts (BEACON) / file registry. */
 void np_refresh_lobby_list(LauncherModel* m) {
     np_connect_and_list(m);
     m->netplay_selected_lobby = -1;
-    m->netplay_status[0] = '\0';
+    /* Keep Connecting… status from np_connect_and_list; clear only when
+     * the caller is an explicit Refresh after a prior error. */
+}
+
+static void mod_note_error(LauncherModel* m);
+static bool mod_commit_launch(LauncherModel* m);
+
+/* Netplay must stay vanilla while mod sync is unproven. Prefer the optional
+ * provider commit_netplay hook (clears an in-session plan without touching
+ * offline selections); otherwise skip mod commit entirely. */
+static bool mod_commit_netplay_launch(LauncherModel* m) {
+    if (!m) return true;
+    const auto* mods = m->mods;
+    if (!mods) return true;
+    if (mods->commit_netplay) {
+        if (mods->commit_netplay(mods->ctx, launcher_model_rom_path(m)))
+            return true;
+        mod_note_error(m);
+        return false;
+    }
+    return true;
 }
 
 void np_try_launch(LauncherModel* m) {
@@ -2423,9 +4191,11 @@ void np_try_launch(LauncherModel* m) {
     if (!np || !np->fill_launch) return;
     RecompLauncherCNetplayLaunch launch{};
     if (!np->fill_launch(np->ctx, &launch) || !launch.enabled) return;
-    m->s.netplay_launch = launch;
-    if (np->clear_launch_pending) np->clear_launch_pending(np->ctx);
-    m->action = LNG_ACTION_LAUNCH;
+    if (mod_commit_netplay_launch(m)) {
+        m->s.netplay_launch = launch;
+        if (np->clear_launch_pending) np->clear_launch_pending(np->ctx);
+        m->action = LNG_ACTION_LAUNCH;
+    }
 }
 
 void np_refresh_host_ip(LauncherModel* m) {
@@ -2433,9 +4203,9 @@ void np_refresh_host_ip(LauncherModel* m) {
     if (!np) return;
     m->netplay_local_address_count = 0;
 
-    /* Always enumerate local interfaces so the Host Lobby dropdown keeps its
-     * selection visible (greyed) when LAN/Direct IP is unchecked. Online create
-     * advertises 0.0.0.0 for server rewrite / ICE — not this pick. */
+    /* Enumerate local interfaces for the Host Lobby "Advertised IP Address"
+     * dropdown (LAN-only and online). Online also uses the pick as host_bind /
+     * preferred LAN advertise; STUN still publishes a public endpoint. */
     if (np->local_address_get) {
         for (int index = 0; index < LNG_NETPLAY_MAX_LOCAL_ADDRESSES; ++index) {
             RecompLauncherCNetplayLocalAddress candidate{};
@@ -2497,6 +4267,101 @@ void np_format_local_address(const RecompLauncherCNetplayLocalAddress& address,
         std::snprintf(out, out_len, "%s", address.address);
 }
 
+/* Matches snes_lobby_default_url() when SNES_NET_LOBBY_URL is unset. */
+static const char kNpDefaultLobbyUrl[] =
+    "ws://netplay.retcomm.net:8765";
+/* Persisted next to guest netplay saves (cwd-relative). */
+static const char kNpNetworkSettingsPath[] = "saves/netplay/network settings";
+
+static void np_ensure_netplay_dir(void) {
+#if defined(_WIN32)
+    _mkdir("saves");
+    _mkdir("saves\\netplay");
+#else
+    mkdir("saves", 0755);
+    mkdir("saves/netplay", 0755);
+#endif
+}
+
+/* Read-only + greyed, but still allows click-drag select / Ctrl+C. */
+static void np_copyable_readonly_input(const char* id, char* buf, size_t buf_len,
+                                       const LauncherTheme& th) {
+    ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                          ImVec4(th.control.r * 0.65f, th.control.g * 0.65f,
+                                 th.control.b * 0.65f, th.control.a));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+                          ImVec4(th.control.r * 0.65f, th.control.g * 0.65f,
+                                 th.control.b * 0.65f, th.control.a));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+                          ImVec4(th.control.r * 0.65f, th.control.g * 0.65f,
+                                 th.control.b * 0.65f, th.control.a));
+    ImGui::InputText(id, buf, buf_len, ImGuiInputTextFlags_ReadOnly);
+    ImGui::PopStyleColor(4);
+}
+
+static void np_save_network_settings(const LauncherModel* m) {
+    if (!m) return;
+    np_ensure_netplay_dir();
+    FILE* f = std::fopen(kNpNetworkSettingsPath, "wb");
+    if (!f) return;
+    std::fprintf(f, "lobby_url=%s\n", m->netplay_lobby_url);
+    std::fprintf(f, "preferred_ip=%s\n",
+                 m->netplay_host_local_ip[0] ? m->netplay_host_local_ip
+                                             : m->netplay_host_ip);
+    std::fprintf(f, "preferred_port=%s\n", m->netplay_host_port);
+    std::fclose(f);
+}
+
+static void np_load_network_settings(LauncherModel* m) {
+    if (!m) return;
+    FILE* f = std::fopen(kNpNetworkSettingsPath, "rb");
+    if (!f) return;
+    char line[320];
+    while (std::fgets(line, sizeof(line), f)) {
+        char* nl = std::strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char* cr = std::strchr(line, '\r');
+        if (cr) *cr = '\0';
+        char* eq = std::strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char* key = line;
+        const char* val = eq + 1;
+        if (std::strcmp(key, "lobby_url") == 0 && val[0]) {
+            std::snprintf(m->netplay_lobby_url, sizeof(m->netplay_lobby_url), "%s",
+                          val);
+        } else if (std::strcmp(key, "preferred_ip") == 0 && val[0]) {
+            std::snprintf(m->netplay_host_ip, sizeof(m->netplay_host_ip), "%s",
+                          val);
+            std::snprintf(m->netplay_host_local_ip,
+                          sizeof(m->netplay_host_local_ip), "%s", val);
+        } else if (std::strcmp(key, "preferred_port") == 0 && val[0]) {
+            std::snprintf(m->netplay_host_port, sizeof(m->netplay_host_port),
+                          "%s", val);
+        }
+        /* Legacy force_turn= lines are ignored — Lobby Settings owns relay. */
+    }
+    std::fclose(f);
+    const auto* np = np_cb(m);
+    if (np && np->set_lobby_url && m->netplay_lobby_url[0])
+        np->set_lobby_url(np->ctx, m->netplay_lobby_url);
+}
+
+static void np_ensure_public_ip(LauncherModel* m) {
+    if (!m || m->netplay_public_ip_resolved) return;
+    const auto* np = np_cb(m);
+    m->netplay_public_ip_resolved = true;
+    if (np && np->external_ip &&
+        np->external_ip(np->ctx, m->netplay_public_ip,
+                        sizeof(m->netplay_public_ip)) &&
+        m->netplay_public_ip[0]) {
+        return;
+    }
+    std::snprintf(m->netplay_public_ip, sizeof(m->netplay_public_ip),
+                  "Unavailable");
+}
+
 void draw_netplay_player_modal(LauncherModel* m) {
     if (m->netplay_name_modal_open) ImGui::OpenPopup("Player Name");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
@@ -2542,21 +4407,116 @@ void draw_netplay_player_modal(LauncherModel* m) {
     }
 }
 
+/* Delay-sync only (no rollback / prediction runway). At ~60 Hz, one frame is
+ * ~16.67 ms, so one-way RTT coverage is ceil(RTT_ms / 33.33) frames. Add a
+ * jitter/TURN pad — Battleship's lower tiers assume prediction absorbs the
+ * rest of the path and are too aggressive here. */
+static int np_delay_frames_from_rtt_ms(int rtt_ms) {
+    if (rtt_ms < 0) rtt_ms = 0;
+    /* ceil(rtt / 33.333) via integer ceil: (rtt + 32) / 33, floor at 1. */
+    int one_way_frames = (rtt_ms + 32) / 33;
+    if (one_way_frames < 1) one_way_frames = 1;
+    const int kJitterPad = 3; /* ICE/TURN variance + scheduling slack */
+    int delay = one_way_frames + kJitterPad;
+    if (delay < 3) delay = 3;   /* delay-only floor (above Battleship's D=2) */
+    if (delay > 20) delay = 20;
+    return delay;
+}
+
+/* Rollback D from measured lobby RTT (§59: WAN-aware tiers).
+ *
+ * Pre-§59 table was BattleShip-feel aggressive (50–80 ms → D=3). MotK §56/§57
+ * soaks showed a TURN WAN link with lobby RTT in that band still needs D=5–6
+ * once transit+jitter are counted (lead ≈ D−1−transit), and the session spent
+ * its first minute invent-storming until arrival-driven auto-delay caught up.
+ * Tiers are +1..+2 vs the old table; floor 3. Callers apply an extra TURN
+ * floor (see Play) because lobby UDP RTT underestimates the game path.
+ *
+ * §60: +1 on every tier at RTT ≥ 80 so non-TURN WAN matches start closer to
+ * arrival-driven D instead of invent-grace hitching for the first ~5s eval. */
+static int np_rb_delay_frames_from_rtt_ms(int rtt_ms) {
+    if (rtt_ms < 0) rtt_ms = 0;
+    int d;
+    if (rtt_ms < 20) d = 3;
+    else if (rtt_ms < 50) d = 3;
+    else if (rtt_ms < 80) d = 4;
+    else if (rtt_ms < 120) d = 6;
+    else if (rtt_ms < 160) d = 7;
+    else if (rtt_ms < 200) d = 8;
+    else if (rtt_ms < 260) d = 9;
+    else d = 10;
+    if (d < 3) d = 3;
+    if (d > 12) d = 12;
+    return d;
+}
+
+/* Invent runway: P = 4 + D (deterministic; matches the MotK RTT table). */
+static int np_rb_prediction_frames_from_rtt_ms(int rtt_ms, int delay_frames) {
+    (void)rtt_ms;
+    if (delay_frames < 2) delay_frames = 2;
+    int p = 4 + delay_frames;
+    if (p < 6) p = 6;
+    if (p > 16) p = 16;
+    return p;
+}
+
+static int np_lobby_max_peer_rtt_ms(LauncherModel* m,
+                                    const RecompLauncherCNetplayCallbacks* np) {
+    int max_rtt = 0;
+    if (!np || !np->member_count || !np->member_get) return 0;
+    const int nmem = np->member_count(np->ctx);
+    for (int mi = 0; mi < nmem; ++mi) {
+        RecompLauncherCNetplayMember mem{};
+        if (!np->member_get(np->ctx, mi, &mem)) continue;
+        if (mem.is_local) continue;
+        if (mem.latency_ms > max_rtt) max_rtt = mem.latency_ms;
+    }
+    (void)m;
+    return max_rtt;
+}
+
+static int np_game_max_players(const LauncherModel* m) {
+    int n = (m && m->player_count > 0) ? m->player_count : 2;
+    if (n < 2) n = 2;
+    if (n > RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS)
+        n = RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS;
+    return n;
+}
+
+static int np_clamp_host_max_players(LauncherModel* m) {
+    const int game_max = np_game_max_players(m);
+    /* Lobby/delay-sync ceiling: RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS / RNET_MAX_SLOTS. */
+    const int sync_max = game_max < RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS
+                             ? game_max : RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS;
+    int n = m->netplay_host_max_players;
+    if (n < 2) n = 2;
+    if (n > sync_max) n = sync_max;
+    m->netplay_host_max_players = n;
+    return n;
+}
+
 void draw_netplay_direct_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->netplay_direct_modal_open) ImGui::OpenPopup("Join Direct");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Join Direct", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextWrapped(
-            "Join a LAN/Direct IP lobby only. The host must have created the lobby "
-            "with LAN/Direct IP checked. For online lobbies, join from the server "
-            "list (same lobby server in Network Settings).");
+            "Join a LAN/Direct IP lobby by IP (or pick a LAN row from the "
+            "lobby list after Refresh — hosts announce via UDP broadcast). "
+            "The host must create with LAN/Direct IP Only checked and keep "
+            "the waiting room open. Use their LAN IP on the same network, or "
+            "their Public IP with UDP port-forwarded to the host PC. Online "
+            "(MotK) lobbies: join from the server list instead.");
         ImGui::Spacing();
         ImGui::SetNextItemWidth(px(280));
         ImGui::InputText("Host IP", m->netplay_direct_ip, sizeof(m->netplay_direct_ip));
         ImGui::SetNextItemWidth(px(160));
         ImGui::InputText("Port", m->netplay_direct_port, sizeof(m->netplay_direct_port),
                          ImGuiInputTextFlags_CharsDecimal);
+        ImGui::SetNextItemWidth(px(280));
+        ImGui::InputText("Password (optional)", m->netplay_password,
+                         sizeof(m->netplay_password),
+                         ImGuiInputTextFlags_Password);
         ImGui::Spacing();
         if (m->netplay_status[0])
             ImGui::TextColored(col(th.warn), "%s", m->netplay_status);
@@ -2577,11 +4537,12 @@ void draw_netplay_direct_modal(LauncherModel* m, const LauncherTheme& th) {
                               m->netplay_direct_port[0] ? m->netplay_direct_port : "7777");
                 if (np_prepare_guest_bind(guest_bind, sizeof(guest_bind),
                                           m->netplay_status, sizeof(m->netplay_status))) {
-                const int rc = np->join(np->ctx, lobby_id, "", guest_bind);
+                const int rc = np->join(np->ctx, lobby_id, m->netplay_password, guest_bind);
                 if (rc == 0) {
                     m->netplay_local_room = true;
                     std::snprintf(m->netplay_host_endpoint, sizeof(m->netplay_host_endpoint),
                                   "%s", lobby_id + 4);
+                    m->netplay_lobby_max_slots = np_game_max_players(m);
                     m->netplay_status[0] = '\0';
                     m->netplay_direct_modal_open = false;
                     ImGui::CloseCurrentPopup();
@@ -2590,11 +4551,13 @@ void draw_netplay_direct_modal(LauncherModel* m, const LauncherTheme& th) {
                                   "Incorrect password.");
                 } else if (rc == -3) {
                     std::snprintf(m->netplay_status, sizeof(m->netplay_status),
-                                  "No LAN/Direct IP lobby at that address. If the host "
-                                  "is online, join their lobby from the server list.");
+                                  "No response from that IP:port. Check the host is in "
+                                  "the LAN waiting room, UDP is forwarded, and the "
+                                  "firewall allows the game port.");
                 } else {
                     std::snprintf(m->netplay_status, sizeof(m->netplay_status),
-                                  "Could not join LAN lobby (full or rejected).");
+                                  "Could not join (lobby full, already started, or "
+                                  "game/version mismatch).");
                 }
                 }
             }
@@ -2632,6 +4595,7 @@ void draw_netplay_network_modal(LauncherModel* m, const LauncherTheme& th) {
             const auto* np = np_cb(m);
             if (np && np->set_lobby_url)
                 np->set_lobby_url(np->ctx, m->netplay_lobby_url);
+            np_save_network_settings(m);
             np_connect_and_list(m);
             m->netplay_network_modal_open = false;
             ImGui::CloseCurrentPopup();
@@ -2654,23 +4618,52 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
         ImGui::InputText("##host_lobby_name", m->netplay_host_name,
                          sizeof(m->netplay_host_name));
         ImGui::Spacing();
+        {
+            const int game_max = np_game_max_players(m);
+            const int sync_max = game_max < RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS
+                                     ? game_max : RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS;
+            const bool game_locked = sync_max <= 2;
+            const int max_players = np_clamp_host_max_players(m);
+            ImGui::TextColored(col(th.text_muted), "Max Players");
+            ImGui::SetNextItemWidth(px(140));
+            ImGui::BeginDisabled(game_locked);
+            char preview[8];
+            std::snprintf(preview, sizeof(preview), "%d", max_players);
+            if (ImGui::BeginCombo("##host_max_players", preview)) {
+                for (int n = 2; n <= sync_max; ++n) {
+                    char label[8];
+                    std::snprintf(label, sizeof(label), "%d", n);
+                    const bool selected = n == max_players;
+                    if (ImGui::Selectable(label, selected))
+                        m->netplay_host_max_players = n;
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            if (game_locked) {
+                ImGui::SameLine();
+                ImGui::TextColored(col(th.text_muted), "(this game is 2-player)");
+            }
+        }
+        ImGui::Spacing();
         bool lan = m->netplay_lan_only;
-        if (ImGui::Checkbox("LAN/Direct IP", &lan)) {
+        if (ImGui::Checkbox("LAN/Direct IP Only", &lan)) {
             m->netplay_lan_only = lan;
             /* Keep the enumerated interfaces + selection; only the enabled
              * state changes. Refresh if we somehow have no list yet. */
             if (m->netplay_local_address_count == 0)
                 np_refresh_host_ip(m);
         }
-        /* Always show IP/Port; grey them out when LAN/Direct IP is off (selection
-         * preserved). Lobby Server URL belongs on the in-room LOBBY modal only. */
-        ImGui::BeginDisabled(!m->netplay_lan_only);
+        /* Advertised IP/Port: which NIC + port peers should use for LAN RTT /
+         * Direct IP. Online still STUNs for a public endpoint; this pick is the
+         * preferred LAN advertise / bind address. */
         if (ImGui::BeginTable("##host_lan_conn", 2, ImGuiTableFlags_SizingFixedFit)) {
             ImGui::TableSetupColumn("ip", ImGuiTableColumnFlags_WidthFixed, px(300));
             ImGui::TableSetupColumn("port", ImGuiTableColumnFlags_WidthFixed, px(120));
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(col(th.text_muted), "IP address");
+            ImGui::TextColored(col(th.text_muted), "Advertised IP Address");
             ImGui::TableSetColumnIndex(1);
             ImGui::TextColored(col(th.text_muted), "Port");
             ImGui::TableNextRow();
@@ -2700,6 +4693,7 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
                             std::snprintf(m->netplay_host_local_ip,
                                           sizeof(m->netplay_host_local_ip), "%s",
                                           m->netplay_local_addresses[index].address);
+                            np_save_network_settings(m);
                         }
                         if (is_selected) ImGui::SetItemDefaultFocus();
                     }
@@ -2715,9 +4709,10 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
             ImGui::InputText("##host_port", m->netplay_host_port,
                              sizeof(m->netplay_host_port),
                              ImGuiInputTextFlags_CharsDecimal);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                np_save_network_settings(m);
             ImGui::EndTable();
         }
-        ImGui::EndDisabled();
         ImGui::Spacing();
         ImGui::TextColored(col(th.text_muted), "Password (optional)");
         ImGui::SetNextItemWidth(px(430));
@@ -2730,15 +4725,20 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        /* Online (unchecked): IP/port are unused for peer connect — allow create
-         * without a resolvable LAN address. LAN/Direct IP: require a pick + port. */
-        const bool can_create = m->netplay_lan_only
-            ? (np_valid_port(m->netplay_host_port) &&
-               m->netplay_host_ip[0] &&
-               std::strcmp(m->netplay_host_ip, "Unavailable") != 0)
-            : true;
+        const bool can_create =
+            np_valid_port(m->netplay_host_port) &&
+            m->netplay_host_ip[0] &&
+            std::strcmp(m->netplay_host_ip, "Unavailable") != 0 &&
+            std::strcmp(m->netplay_host_ip, "Detecting...") != 0 &&
+            launcher_model_netplay_disc_ok(m);
         ImGui::BeginDisabled(!can_create);
         if (ImGui::Button("Create Lobby", ImVec2(px(150), 0))) {
+            if (!launcher_model_netplay_disc_ok(m)) {
+                std::snprintf(host_create_status, sizeof(host_create_status), "%s",
+                              m->verify.netplay_detail[0]
+                                  ? m->verify.netplay_detail
+                                  : "Disc TOC not valid for netplay.");
+            } else {
             const auto* np = np_cb(m);
             if (np && np->create) {
                 /* Online create needs the lobby WebSocket. LAN/Direct IP only
@@ -2746,23 +4746,16 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
                  * there, or the same room would appear twice in the list. */
                 if (!m->netplay_lan_only)
                     np_connect_and_list(m);
-                /* LAN/Direct IP: advertise the selected interface:port. Online:
-                 * ignore the greyed-out IP/port fields, bind 0.0.0.0, prefer
-                 * 7777, and auto-pick nearby if busy (lobby rewrite / ICE). */
+                /* Selected NIC:port is the advertised / preferred bind address
+                 * for both LAN-only and online (online may bump the port). */
                 char endpoint[96];
-                const char* port_label = "7777";
-                if (m->netplay_lan_only) {
-                    port_label = m->netplay_host_port[0]
-                        ? m->netplay_host_port : "7777";
-                    std::snprintf(endpoint, sizeof(endpoint), "%s:%s",
-                                  m->netplay_host_ip[0] ? m->netplay_host_ip : "127.0.0.1",
-                                  port_label);
-                } else {
-                    std::snprintf(endpoint, sizeof(endpoint), "0.0.0.0:7777");
-                }
-                /* Universal MotK port policy (owned by recomp-ui, not the host):
-                 * LAN requires the exact UI port; online ignores the field and
-                 * auto-picks 7777..7808. */
+                const char* port_label = m->netplay_host_port[0]
+                    ? m->netplay_host_port : "7777";
+                std::snprintf(endpoint, sizeof(endpoint), "%s:%s",
+                              m->netplay_host_ip[0] ? m->netplay_host_ip : "127.0.0.1",
+                              port_label);
+                /* LAN requires the exact UI port; online auto-picks nearby if
+                 * the preferred port is busy. */
                 const int want_port = launcher_endpoint_port(endpoint);
                 bool port_ok = true;
                 if (m->netplay_lan_only) {
@@ -2775,45 +4768,59 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
                     }
                 } else {
                     const int free_port =
-                        launcher_udp_find_free_port(/*preferred=*/7777, 32);
+                        launcher_udp_find_free_port(/*preferred=*/want_port, 32);
                     if (free_port < 0 ||
-                        (free_port != 7777 &&
+                        (free_port != want_port &&
                          launcher_endpoint_set_port(endpoint, sizeof(endpoint),
                                                     free_port) != 0)) {
                         std::snprintf(host_create_status, sizeof(host_create_status),
-                                      "No free UDP port near 7777. Try again.");
+                                      "No free UDP port near %s. Try again.",
+                                      port_label);
                         port_ok = false;
                     }
                 }
                 if (port_ok) {
                     const char* lobby = m->netplay_host_name[0]
                         ? m->netplay_host_name : "Netplay Lobby";
+                    const int max_slots = np_clamp_host_max_players(m);
+                    /* Seed host match_caps from UI defaults before create. */
+                    if (np->rollback_set)
+                        (void)np->rollback_set(np->ctx,
+                                               m->netplay_rollback ? 1 : 0);
+                    if (np->input_prediction_set)
+                        (void)np->input_prediction_set(
+                            np->ctx, m->netplay_lobby_input_prediction);
+                    if (np->input_delay_set)
+                        (void)np->input_delay_set(np->ctx,
+                                                  m->netplay_lobby_input_delay);
                     const int rc = np->create(np->ctx, lobby, endpoint,
                                               m->netplay_host_password, &m->s,
-                                              m->netplay_lan_only ? 1 : 0);
+                                              m->netplay_lan_only ? 1 : 0,
+                                              max_slots);
                     if (rc == -4) {
                         std::snprintf(host_create_status, sizeof(host_create_status),
                                       m->netplay_lan_only
                                           ? "Port %s is already in use. Choose a "
                                             "different port for this LAN lobby."
-                                          : "No free UDP port near 7777. Try again.",
+                                          : "No free UDP port near %s. Try again.",
                                       port_label);
                     } else if (rc != 0) {
                         std::snprintf(host_create_status, sizeof(host_create_status),
                                       "Could not create lobby.");
                     } else {
-                        /* LAN: keep the UI port in sync. Online: leave the
-                         * greyed field alone; actual bind is host_endpoint. */
-                        if (m->netplay_lan_only) {
-                            if (const char* colon = std::strrchr(endpoint, ':')) {
-                                std::snprintf(m->netplay_host_port,
-                                              sizeof(m->netplay_host_port), "%s",
-                                              colon + 1);
-                            }
+                        if (const char* colon = std::strrchr(endpoint, ':')) {
+                            std::snprintf(m->netplay_host_port,
+                                          sizeof(m->netplay_host_port), "%s",
+                                          colon + 1);
                         }
                         std::snprintf(m->netplay_host_endpoint,
                                       sizeof(m->netplay_host_endpoint), "%s",
                                       endpoint);
+                        std::snprintf(m->netplay_host_local_ip,
+                                      sizeof(m->netplay_host_local_ip), "%s",
+                                      m->netplay_host_ip);
+                        np_save_network_settings(m);
+                        m->netplay_lobby_max_slots = max_slots;
                         host_create_status[0] = '\0';
                         /* LAN/Direct IP is a local room (file registry). Online
                          * create seats on the WebSocket lobby when connected. */
@@ -2824,8 +4831,14 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
                     }
                 }
             }
+            } /* else disc ok */
         }
         ImGui::EndDisabled();
+        if (!launcher_model_netplay_disc_ok(m) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s",
+                              m->verify.netplay_detail[0]
+                                  ? m->verify.netplay_detail
+                                  : "Mount the supported .cue dump for netplay.");
         if (host_create_status[0])
             ImGui::TextColored(col(th.warn), "%s", host_create_status);
         ImGui::EndPopup();
@@ -2870,6 +4883,8 @@ void draw_netplay_password_modal(LauncherModel* m, const LauncherTheme& th) {
                         m->netplay_local_room = false;
                         m->netplay_host_endpoint[0] = '\0';
                     }
+                    m->netplay_lobby_max_slots =
+                        row.max_slots >= 2 ? row.max_slots : np_game_max_players(m);
                     m->netplay_password_modal_open = false;
                     m->netplay_status[0] = '\0';
                     ImGui::CloseCurrentPopup();
@@ -2906,7 +4921,16 @@ static void np_ingest_last_error(LauncherModel* m, const RecompLauncherCNetplayC
                       "Need two players before starting.");
     else if (std::strcmp(err, "missing_endpoints") == 0)
         std::snprintf(m->netplay_status, sizeof(m->netplay_status),
-                      "Guest connection info missing — have them rejoin.");
+                      "Peer connection info missing — have guests rejoin, then "
+                      "retry Play.");
+    else if (std::strcmp(err, "relay_unavailable") == 0)
+        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                      "Lobby UDP SFU is unavailable. Fix INPUT_RELAY_* on "
+                      "the lobby server (online matches require it).");
+    else if (std::strcmp(err, "host_slot_fixed") == 0)
+        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                      "Host stays in seat 1. Rearrange guests among the "
+                      "other seats.");
     else if (std::strcmp(err, "not_host") == 0)
         std::snprintf(m->netplay_status, sizeof(m->netplay_status),
                       "Only the host can start the match.");
@@ -2932,6 +4956,16 @@ static void np_ingest_last_error(LauncherModel* m, const RecompLauncherCNetplayC
     else if (std::strcmp(err, "netplay_start_failed") == 0)
         std::snprintf(m->netplay_status, sizeof(m->netplay_status),
                       "Netplay could not start. Check the log and retry.");
+    else if (std::strcmp(err, "disc_mismatch") == 0)
+        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                      "Disc dump does not match the host (TOC / tracks). "
+                      "Mount the same supported .cue dump.");
+    else if (std::strcmp(err, "version_mismatch") == 0)
+        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                      "Game version does not match the lobby.");
+    else if (std::strcmp(err, "game_mismatch") == 0)
+        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                      "This lobby is for a different game.");
     else
         std::snprintf(m->netplay_status, sizeof(m->netplay_status),
                       "Lobby error: %s", err);
@@ -2951,6 +4985,10 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
                                      : m->netplay_local_room;
     if (!seated) {
         m->netplay_local_room = false;
+        m->netplay_lobby_settings_open = false;
+        /* Keep netplay_lobby_max_slots across create/join races: online create
+         * can report unseated for a few frames, and wiping this falls back to
+         * game num_players (e.g. 5P) while the list correctly shows 1/2. */
         if (ImGui::BeginPopupModal("LOBBY", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
@@ -2960,9 +4998,13 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
 
     ImGui::OpenPopup("LOBBY");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(px(580), 0), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("LOBBY", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    /* Always recenter: content height changes as members join/leave, and
+     * ImGuiCond_Appearing left the room modal stuck off-center after join. */
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(px(640), 0), ImGuiCond_Always);
+    const ImGuiWindowFlags lobby_flags =
+        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove;
+    if (!ImGui::BeginPopupModal("LOBBY", nullptr, lobby_flags)) return;
 
     /* Only file-backed LAN/Direct rooms show IP/Port. Server-list joins always
      * show the lobby URL — do not use Host Lobby's LAN checkbox or a stale
@@ -2979,27 +5021,59 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
                 *colon = '\0';
             }
         }
-        ImGui::BeginDisabled(true);
+        np_ensure_public_ip(m);
         if (ImGui::BeginTable("##lobby_lan_conn", 2, ImGuiTableFlags_SizingFixedFit)) {
-            ImGui::TableSetupColumn("ip", ImGuiTableColumnFlags_WidthFixed, px(300));
+            ImGui::TableSetupColumn("ip", ImGuiTableColumnFlags_WidthFixed, px(360));
             ImGui::TableSetupColumn("port", ImGuiTableColumnFlags_WidthFixed, px(120));
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(col(th.text_muted), "IP address");
+            ImGui::TextColored(col(th.text_muted), "LAN IP Address");
             ImGui::TableSetColumnIndex(1);
             ImGui::TextColored(col(th.text_muted), "Port");
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::SetNextItemWidth(-1.0f);
-            ImGui::InputText("##lobby_ip", room_ip, sizeof(room_ip),
-                             ImGuiInputTextFlags_ReadOnly);
+            np_copyable_readonly_input("##lobby_ip", room_ip, sizeof(room_ip), th);
             ImGui::TableSetColumnIndex(1);
             ImGui::SetNextItemWidth(-1.0f);
-            ImGui::InputText("##lobby_port", room_port, sizeof(room_port),
-                             ImGuiInputTextFlags_ReadOnly);
+            np_copyable_readonly_input("##lobby_port", room_port, sizeof(room_port),
+                                       th);
             ImGui::EndTable();
         }
-        ImGui::EndDisabled();
+        ImGui::Spacing();
+        ImGui::TextColored(col(th.text_muted), "Public IP Address");
+        if (ImGui::BeginTable("##lobby_public_ip", 2, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("ip", ImGuiTableColumnFlags_WidthFixed, px(440));
+            ImGui::TableSetupColumn("help", ImGuiTableColumnFlags_WidthFixed, px(36));
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::SetNextItemWidth(-1.0f);
+            np_copyable_readonly_input("##lobby_public_ip", m->netplay_public_ip,
+                                       sizeof(m->netplay_public_ip), th);
+            ImGui::TableSetColumnIndex(1);
+            const float help_sz = ImGui::GetFrameHeight();
+            if (ImGui::Button("?", ImVec2(help_sz, help_sz))) {
+                /* tooltip on hover only */
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(px(360));
+                ImGui::TextUnformatted(
+                    "Direct IP over the internet needs UDP port forwarding on "
+                    "your router.\n\n"
+                    "1. On your router, forward the Port shown above (UDP) from "
+                    "the Public IP Address to this PC's LAN IP Address.\n"
+                    "2. Remote friends Join Direct with your Public IP and that "
+                    "Port.\n"
+                    "3. Players on your local network can keep using the LAN IP "
+                    "Address.\n\n"
+                    "Router menus differ (Port Forwarding, Virtual Server, or "
+                    "NAT). Leave the lobby open while they connect.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            ImGui::EndTable();
+        }
     } else {
         char lobby_server[256];
         const char* url = np->default_url ? np->default_url(np->ctx) : "";
@@ -3007,15 +5081,20 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
         std::snprintf(lobby_server, sizeof(lobby_server), "%s",
                       (url && url[0]) ? url : "lobby server");
         ImGui::TextColored(col(th.text_muted), "Lobby Server");
-        ImGui::BeginDisabled(true);
-        ImGui::SetNextItemWidth(px(430));
-        ImGui::InputText("##lobby_server", lobby_server, sizeof(lobby_server),
-                         ImGuiInputTextFlags_ReadOnly);
-        ImGui::EndDisabled();
+        ImGui::SetNextItemWidth(px(480));
+        np_copyable_readonly_input("##lobby_server", lobby_server,
+                                   sizeof(lobby_server), th);
     }
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
+#if RECOMP_UI_ENABLE_MODS
+    if (m->mods) {
+        ImGui::TextColored(col(th.text_muted),
+                           "Mods are disabled for netplay (vanilla match).");
+        ImGui::Spacing();
+    }
+#endif
     if (m->netplay_status[0]) {
         ImGui::TextColored(col(th.warn), "%s", m->netplay_status);
         ImGui::Spacing();
@@ -3025,9 +5104,16 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
     bool occupied[RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS] = {};
     const bool is_host = np->is_host && np->is_host(np->ctx);
     const int count = np->member_count ? np->member_count(np->ctx) : 0;
-    /* Lobby seat count: game player_count when set, else the ABI ceiling. */
-    int max_slots = m->player_count > 0 ? m->player_count
-                                        : RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS;
+    /* Prefer backend room ceiling, then sticky create/join value, then game max. */
+    int max_slots = 0;
+    if (np->lobby_max_slots) {
+        max_slots = np->lobby_max_slots(np->ctx);
+        if (max_slots >= 2) m->netplay_lobby_max_slots = max_slots;
+    }
+    if (max_slots < 2)
+        max_slots = m->netplay_lobby_max_slots > 0
+                        ? m->netplay_lobby_max_slots
+                        : np_game_max_players(m);
     if (max_slots < 2) max_slots = 2;
     if (max_slots > RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS)
         max_slots = RECOMP_LAUNCHER_NETPLAY_MAX_MEMBERS;
@@ -3041,13 +5127,14 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
     int seated_players = 0;
     for (int slot = 0; slot < max_slots; ++slot)
         if (occupied[slot]) ++seated_players;
-    if (ImGui::BeginTable("lobby_players", 5,
+    if (ImGui::BeginTable("lobby_players", 6,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
                           ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("##move", ImGuiTableColumnFlags_WidthFixed, px(32));
-        ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, px(90));
+        ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, px(40));
         ImGui::TableSetupColumn("Player", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, px(110));
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, px(100));
+        ImGui::TableSetupColumn("Latency", ImGuiTableColumnFlags_WidthFixed, px(72));
         ImGui::TableSetupColumn("Kick", ImGuiTableColumnFlags_WidthFixed, px(56));
         ImGui::TableHeadersRow();
         const float text_h = ImGui::GetTextLineHeight();
@@ -3061,11 +5148,13 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
                               ImGuiSelectableFlags_SpanAllColumns |
                               ImGuiSelectableFlags_AllowOverlap,
                               ImVec2(0, member_row_h));
-            if (is_host && np->move_member && ImGui::BeginDragDropTarget()) {
+            /* Slot 0 = session host / sim authority — guests rearrange only. */
+            if (is_host && np->move_member && slot != 0 &&
+                ImGui::BeginDragDropTarget()) {
                 if (const ImGuiPayload* payload =
                         ImGui::AcceptDragDropPayload("NETPLAY_MEMBER_SLOT")) {
                     const int from_slot = *(const int*)payload->Data;
-                    if (from_slot != slot)
+                    if (from_slot != slot && from_slot != 0)
                         (void)np->move_member(np->ctx, from_slot, slot);
                 }
                 ImGui::EndDragDropTarget();
@@ -3076,19 +5165,21 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
             ImVec2 grip_max = ImGui::GetItemRectMax();
             const float grip_cx = (grip_min.x + grip_max.x) * 0.5f;
             const float grip_cy = (grip_min.y + grip_max.y) * 0.5f;
-            ImU32 grip_col = imcol(is_host && occupied[slot] ? th.text_muted : th.border);
+            const int can_drag =
+                is_host && occupied[slot] && slot != 0 && np->move_member;
+            ImU32 grip_col = imcol(can_drag ? th.text_muted : th.border);
             ImDrawList* grip_dl = ImGui::GetWindowDrawList();
             for (int line = -1; line <= 1; ++line) {
                 const float y = grip_cy + px(4) * line;
                 grip_dl->AddLine(ImVec2(grip_cx - px(7), y),
                                  ImVec2(grip_cx + px(7), y), grip_col, px(1.5f));
             }
-            if (is_host && np->move_member && occupied[slot]) {
+            if (can_drag) {
                 if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                     ImGui::SetDragDropPayload("NETPLAY_MEMBER_SLOT", &slot, sizeof(slot));
                     ImGui::BeginGroup();
-                    ImGui::Text("Player %d", slot + 1);
+                    ImGui::Text("P%d", slot + 1);
                     ImGui::SameLine(0, px(28));
                     ImGui::TextUnformatted(slots[slot].display_name);
                     ImGui::SameLine(0, px(28));
@@ -3100,7 +5191,7 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
             }
             ImGui::TableSetColumnIndex(1);
             table_row_vcenter(member_row_h, text_h);
-            ImGui::Text("Player %d", slot + 1);
+            ImGui::Text("P%d", slot + 1);
             ImGui::TableSetColumnIndex(2);
             table_row_vcenter(member_row_h, text_h);
             if (!occupied[slot]) ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
@@ -3114,7 +5205,23 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
                 ImGui::TextColored(col(th.good), "Connected");
             else
                 ImGui::TextColored(col(th.text_muted), "Waiting");
+            if (occupied[slot] && slots[slot].bios_offer_valid &&
+                ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "BIOS: %s%s",
+                    slots[slot].bios_prefer_openbios ? "OpenBIOS" : "SCPH-1001",
+                    slots[slot].bios_can_scph1001 ? "" : " (no SCPH dump)");
+            }
             ImGui::TableSetColumnIndex(4);
+            table_row_vcenter(member_row_h, text_h);
+            /* RTT to that seat from local peer — never on the local row. */
+            if (occupied[slot] && !slots[slot].is_local &&
+                slots[slot].latency_ms >= 0) {
+                ImGui::Text("%d ms", slots[slot].latency_ms);
+            } else {
+                ImGui::TextColored(col(th.text_muted), "—");
+            }
+            ImGui::TableSetColumnIndex(5);
             {
                 const float kick_btn = px(34);
                 const bool can_kick = is_host && occupied[slot] &&
@@ -3174,11 +5281,61 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
         }
         ImGui::EndTable();
     }
+    /* Session BIOS notice (OpenBIOS vs SCPH1001). Keep copy plain — hosts care
+     * about save-state compatibility, not kernel-RAM details.
+     * Orange OpenBIOS override only when a peer cannot run SCPH; host retail
+     * preference otherwise settles SCPH (even if a guest prefers OpenBIOS). */
+    {
+        int host_prefer_open = 0;
+        int host_found = 0;
+        int all_can_scph = 1;
+        int saw = 0;
+        for (int slot = 0; slot < max_slots; ++slot) {
+            if (!occupied[slot]) continue;
+            ++saw;
+            const int offer_ok = slots[slot].bios_offer_valid;
+            const int prefer_open = !offer_ok || slots[slot].bios_prefer_openbios;
+            const int can_scph = offer_ok && slots[slot].bios_can_scph1001;
+            if (slots[slot].is_host) {
+                host_found = 1;
+                host_prefer_open = prefer_open ? 1 : 0;
+            }
+            if (!can_scph) all_can_scph = 0;
+        }
+        if (saw >= 1 && host_found) {
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(0.0f);
+            if (host_prefer_open) {
+                ImGui::TextColored(
+                    col(th.good),
+                    "Host has selected OpenBIOS for this session.\n"
+                    "Note: Save states are not cross compatible with SCPH1001 "
+                    "and OpenBIOS sessions");
+            } else if (all_can_scph) {
+                ImGui::TextColored(
+                    col(th.good),
+                    "All users agree on proprietary BIOS SCPH1001.bin for this "
+                    "session.\n"
+                    "Note: Save states are not cross compatible with SCPH1001 "
+                    "and OpenBIOS sessions");
+            } else {
+                ImGui::TextColored(
+                    col(th.warn),
+                    "1 or more users lacks proprietary BIOS, using OpenBIOS for "
+                    "this session instead.\n"
+                    "Note: Save states are not cross compatible with SCPH1001 "
+                    "and OpenBIOS sessions");
+            }
+            ImGui::PopTextWrapPos();
+        }
+    }
     ImGui::Spacing();
     {
         const float btn_h = px(36);
         const float leave_w = px(130);
+        const float settings_w = px(110);
         const float play_w = px(150);
+        const float gap = px(10);
         const float row_w = ImGui::GetContentRegionAvail().x;
         const float row_x = ImGui::GetCursorPosX();
         const float row_y = ImGui::GetCursorPosY();
@@ -3194,12 +5351,47 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
         if (ImGui::Button("Leave Lobby", ImVec2(leave_w, btn_h))) {
             m->netplay_local_room = false;
+            m->netplay_lobby_settings_open = false;
+            m->netplay_lobby_max_slots = 0;
             if (np->leave) (void)np->leave(np->ctx);
             ImGui::CloseCurrentPopup();
         }
         ImGui::PopStyleColor(4);
 
         if (is_host) {
+            ImGui::SetCursorPos(ImVec2(row_x + leave_w + gap, row_y));
+            if (ImGui::Button("Settings", ImVec2(settings_w, btn_h))) {
+                if (np->input_delay_get)
+                    m->netplay_lobby_input_delay = np->input_delay_get(np->ctx);
+                if (m->netplay_lobby_input_delay < 2)
+                    m->netplay_lobby_input_delay = 2;
+                if (m->netplay_lobby_input_delay > 20)
+                    m->netplay_lobby_input_delay = 20;
+                if (np->input_prediction_get)
+                    m->netplay_lobby_input_prediction =
+                        np->input_prediction_get(np->ctx);
+                if (m->netplay_lobby_input_prediction < 2)
+                    m->netplay_lobby_input_prediction = 2;
+                if (m->netplay_lobby_input_prediction > 16)
+                    m->netplay_lobby_input_prediction = 16;
+                if (np->rollback_get)
+                    m->netplay_rollback = np->rollback_get(np->ctx) != 0;
+                if (m->netplay_local_room) {
+                    m->netplay_force_input_relay = false;
+                    m->netplay_force_turn = false;
+                } else {
+                    if (np->force_input_relay_get) {
+                        m->netplay_force_input_relay =
+                            np->force_input_relay_get(np->ctx) != 0;
+                    }
+                    if (np->force_turn_get) {
+                        m->netplay_force_turn =
+                            np->force_turn_get(np->ctx) != 0;
+                    }
+                }
+                m->netplay_lobby_settings_open = true;
+            }
+
             /* ▶ Play — green, pinned right. */
             const LngColor play_bg = th.good;
             auto clamp01 = [](float v) { return v > 1.0f ? 1.0f : v; };
@@ -3221,6 +5413,43 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
             const bool can_start = seated_players >= 2;
             ImGui::BeginDisabled(!can_start);
             if (ImGui::Button(u8"\u25B6 Play", ImVec2(play_w, btn_h))) {
+                /* Ensure engine match_caps.rollback matches UI before start. */
+                if (np->rollback_set)
+                    (void)np->rollback_set(np->ctx, m->netplay_rollback ? 1 : 0);
+                const bool use_rb = m->netplay_rollback;
+                const int max_rtt = np_lobby_max_peer_rtt_ms(m, np);
+                /* Auto D: rollback uses §59 WAN-aware tiers; delay-sync uses
+                 * the padded one-way formula. Manual keeps Lobby Settings.
+                 * Forced TURN: lobby ICE underestimates match-path load —
+                 * pad RTT before the tier table and floor D at 6. */
+                if (!m->netplay_manual_input_delay && np->input_delay_set) {
+                    bool force_turn = m->netplay_force_turn;
+                    if (np->force_turn_get)
+                        force_turn = np->force_turn_get(np->ctx) != 0;
+                    int rtt_for_d = max_rtt;
+                    if (use_rb && force_turn) {
+                        /* Relay jitter + pump asymmetry; soak §587 host
+                         * mid-match rtt_raw≈90 while lobby guest REPORT≈30. */
+                        if (rtt_for_d < 80)
+                            rtt_for_d = 80;
+                        rtt_for_d += 40;
+                    }
+                    int delay = use_rb
+                        ? np_rb_delay_frames_from_rtt_ms(rtt_for_d)
+                        : np_delay_frames_from_rtt_ms(max_rtt);
+                    if (use_rb && force_turn && delay < 6)
+                        delay = 6;
+                    m->netplay_lobby_input_delay = delay;
+                    (void)np->input_delay_set(np->ctx, delay);
+                }
+                /* Auto P (rollback only): invent runway from RTT + committed D. */
+                if (use_rb && !m->netplay_manual_input_prediction &&
+                    np->input_prediction_set) {
+                    const int pred = np_rb_prediction_frames_from_rtt_ms(
+                        max_rtt, m->netplay_lobby_input_delay);
+                    m->netplay_lobby_input_prediction = pred;
+                    (void)np->input_prediction_set(np->ctx, pred);
+                }
                 if (np->set_ready)
                     (void)np->set_ready(np->ctx, 1);
                 const int rc = np->request_start
@@ -3248,6 +5477,190 @@ void draw_netplay_room_modal(LauncherModel* m, const LauncherTheme& th) {
         /* Advance layout past the button row. */
         ImGui::SetCursorPos(ImVec2(row_x, row_y + btn_h));
         ImGui::Dummy(ImVec2(row_w, 0));
+    }
+
+    if (is_host && m->netplay_lobby_settings_open)
+        ImGui::OpenPopup("Lobby Settings");
+    if (ImGui::BeginPopupModal("Lobby Settings", &m->netplay_lobby_settings_open,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        /* Disable Rollback first — gates Manual Input Prediction below. */
+        {
+            bool disable_rb = !m->netplay_rollback;
+            if (np->rollback_get)
+                disable_rb = np->rollback_get(np->ctx) == 0;
+            if (ImGui::Checkbox("Disable Rollback", &disable_rb)) {
+                m->netplay_rollback = !disable_rb;
+                if (np->rollback_set)
+                    (void)np->rollback_set(np->ctx, m->netplay_rollback ? 1 : 0);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(px(360));
+                ImGui::TextUnformatted(
+                    "Off (default): invent missing remote inputs and correct "
+                    "with rollback episodes (match_caps.rollback=1).\n\n"
+                    "On: force delay-sync for the match. Manual Input "
+                    "Prediction is locked out; only Input Delay applies.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+        }
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Manual Input Delay");
+        ImGui::SameLine();
+        ImGui::TextColored(col(th.text_muted), "(frames)");
+        {
+            bool manual = m->netplay_manual_input_delay;
+            if (ImGui::Checkbox("##manual_input_delay", &manual))
+                m->netplay_manual_input_delay = manual;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(px(360));
+                ImGui::TextUnformatted(
+                    "Off (default): at match start the host sets input delay "
+                    "from the highest peer latency in the lobby.\n\n"
+                    "On: use the frame value to the right for every player.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!m->netplay_manual_input_delay);
+            ImGui::SetNextItemWidth(px(140));
+            int delay = m->netplay_lobby_input_delay;
+            if (ImGui::InputInt("##lobby_input_delay", &delay, 1, 1)) {
+                if (delay < 2) delay = 2;
+                if (delay > 20) delay = 20;
+                m->netplay_lobby_input_delay = delay;
+                if (np->input_delay_set)
+                    (void)np->input_delay_set(np->ctx, delay);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                delay = m->netplay_lobby_input_delay;
+                if (delay < 2) delay = 2;
+                if (delay > 20) delay = 20;
+                m->netplay_lobby_input_delay = delay;
+                if (np->input_delay_set)
+                    (void)np->input_delay_set(np->ctx, delay);
+            }
+            ImGui::SameLine();
+            {
+                const float help_sz = ImGui::GetFrameHeight();
+                if (ImGui::Button("?##input_delay_help", ImVec2(help_sz, help_sz))) {
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(px(360));
+                    ImGui::TextUnformatted(
+                        "Committed input delay D (send lead / buffer).\n\n"
+                        "With rollback (Disable Rollback off), auto D from "
+                        "max peer RTT (§59/§60 WAN-aware):\n"
+                        "  0–50 ms → 3, 50–80 → 4, 80–120 → 6,\n"
+                        "  120–160 → 7, then steps up (floor 3).\n"
+                        "Forced TURN floors at 6 (lobby RTT underestimates "
+                        "the relay path).\n\n"
+                        "With delay-sync (Disable Rollback on), auto D covers "
+                        "one-way RTT at 60 Hz plus a 3-frame jitter pad:\n"
+                        "  D = ceil(RTT_ms / 33.3) + 3  (min 3, max 20)\n\n"
+                        "Too low stalls when packets arrive late. Too high adds "
+                        "input lag for everyone.");
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Manual Input Prediction");
+        ImGui::SameLine();
+        ImGui::TextColored(col(th.text_muted), "(frames)");
+        {
+            const bool rb_on = m->netplay_rollback;
+            ImGui::BeginDisabled(!rb_on);
+            bool manual_p = m->netplay_manual_input_prediction;
+            if (ImGui::Checkbox("##manual_input_prediction", &manual_p))
+                m->netplay_manual_input_prediction = manual_p;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(px(360));
+                ImGui::TextUnformatted(
+                    "Rollback invent runway P. Off (default): host sets P from "
+                    "peer RTT at match start. On: use the frame value to the "
+                    "right.\n\n"
+                    "Locked when Disable Rollback is on (delay-sync).");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!rb_on || !m->netplay_manual_input_prediction);
+            ImGui::SetNextItemWidth(px(140));
+            int pred = m->netplay_lobby_input_prediction;
+            if (ImGui::InputInt("##lobby_input_prediction", &pred, 1, 1)) {
+                if (pred < 2) pred = 2;
+                if (pred > 16) pred = 16;
+                m->netplay_lobby_input_prediction = pred;
+                if (np->input_prediction_set)
+                    (void)np->input_prediction_set(np->ctx, pred);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                pred = m->netplay_lobby_input_prediction;
+                if (pred < 2) pred = 2;
+                if (pred > 16) pred = 16;
+                m->netplay_lobby_input_prediction = pred;
+                if (np->input_prediction_set)
+                    (void)np->input_prediction_set(np->ctx, pred);
+            }
+            ImGui::SameLine();
+            {
+                const float help_sz = ImGui::GetFrameHeight();
+                if (ImGui::Button("?##input_prediction_help",
+                                 ImVec2(help_sz, help_sz))) {
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(px(360));
+                    ImGui::TextUnformatted(
+                        "How far ahead of the remote tip a peer may invent "
+                        "hold-last inputs before stalling (phase_lock).\n\n"
+                        "Tip: prediction should be 4 + delay.\n\n"
+                        "Auto (checkbox off): P = 4 + D (clamped 6..16).\n"
+                        "Manual: keep the same relationship unless you are "
+                        "deliberately tuning.\n\n"
+                        "Outside this window the fast peer freezes until the "
+                        "buffer refills; sustained freezes raise delay.");
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
+        }
+        ImGui::Spacing();
+        if (launcher_model_multitap_analog_available(m)) {
+            bool analog_hack = m->s.multitap_analog != 0;
+            if (np->multitap_analog_get)
+                analog_hack = np->multitap_analog_get(np->ctx) != 0;
+            if (ImGui::Checkbox("Multitap analog (hack)", &analog_hack)) {
+                m->s.multitap_analog = analog_hack ? 1 : 0;
+                if (np->multitap_analog_set)
+                    (void)np->multitap_analog_set(np->ctx, analog_hack ? 1 : 0);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(px(360));
+                ImGui::TextUnformatted(
+                    "Host-enforced DualShock sticks on multitap tap seats for "
+                    "this match (match_caps.multitap_analog). Off = faithful "
+                    "digital taps. Peers apply the host setting at launch.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            ImGui::Spacing();
+        }
+        if (ImGui::Button("Close", ImVec2(px(120), 0))) {
+            m->netplay_lobby_settings_open = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
     ImGui::EndPopup();
 }
@@ -3284,6 +5697,8 @@ void np_join_selected(LauncherModel* m) {
                 m->netplay_local_room = false;
                 m->netplay_host_endpoint[0] = '\0';
             }
+            m->netplay_lobby_max_slots =
+                row.max_slots >= 2 ? row.max_slots : np_game_max_players(m);
         } else if (rc == -3) {
             std::snprintf(m->netplay_status, sizeof(m->netplay_status),
                           "No LAN/Direct IP lobby at that address. If the host "
@@ -3298,6 +5713,12 @@ void np_join_selected(LauncherModel* m) {
 void draw_netplay(LauncherModel* m, const LauncherTheme& th) {
     const auto* np = np_cb(m);
     if (!np) return;
+    static bool network_settings_loaded = false;
+    if (!network_settings_loaded) {
+        network_settings_loaded = true;
+        np_load_network_settings(m);
+        np_refresh_host_ip(m);
+    }
     if (!m->s.netplay_player_name[0] && !m->netplay_name_modal_open && !m->netplay_name_prompted) {
         m->netplay_name_prompted = true;
         m->netplay_name_modal_open = true;
@@ -3308,6 +5729,18 @@ void draw_netplay(LauncherModel* m, const LauncherTheme& th) {
     np_ingest_last_error(m, np);
     if (np->launch_pending && np->launch_pending(np->ctx))
         np_try_launch(m);
+
+    const bool np_online = np->connected && np->connected(np->ctx);
+    const bool np_connecting = np->connecting && np->connecting(np->ctx);
+    if (np_online && m->netplay_status[0] &&
+        std::strncmp(m->netplay_status, "Connecting", 10) == 0) {
+        m->netplay_status[0] = '\0';
+    } else if (!np_online && !np_connecting && m->netplay_list_fresh &&
+               m->netplay_status[0] &&
+               std::strncmp(m->netplay_status, "Connecting", 10) == 0) {
+        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                      "Could not reach lobby server.");
+    }
 
     begin_container("netplay_lobbies", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::TextColored(col(th.accent2), "LOBBIES");
@@ -3321,13 +5754,15 @@ void draw_netplay(LauncherModel* m, const LauncherTheme& th) {
     const float text_h = ImGui::GetTextLineHeight();
     /* Extra left inset so Lobby column text isn't flush with the panel edge. */
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(px(14), px(6)));
-    if (ImGui::BeginTable("netplay_lobby_table", 4,
+    if (ImGui::BeginTable("netplay_lobby_table", 5,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
                           ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Lobby", ImGuiTableColumnFlags_WidthStretch, 0.54f);
-        ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 0.24f);
-        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthStretch, 0.12f);
-        ImGui::TableSetupColumn("Join", ImGuiTableColumnFlags_WidthFixed, px(100));
+        /* Lobby/Game stretch; Players/Latency/Join stay fixed to content. */
+        ImGui::TableSetupColumn("Lobby", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 0.7f);
+        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthFixed, px(72));
+        ImGui::TableSetupColumn("Latency", ImGuiTableColumnFlags_WidthFixed, px(72));
+        ImGui::TableSetupColumn("Join", ImGuiTableColumnFlags_WidthFixed, px(88));
         ImGui::TableHeadersRow();
         if (rows <= 0) {
             ImGui::TableNextRow(ImGuiTableRowFlags_None, lobby_row_h);
@@ -3339,6 +5774,8 @@ void draw_netplay(LauncherModel* m, const LauncherTheme& th) {
             ImGui::TableSetColumnIndex(2);
             ImGui::TextUnformatted("");
             ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted("");
+            ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted("");
         }
         for (int i = 0; i < rows; ++i) {
@@ -3376,17 +5813,33 @@ void draw_netplay(LauncherModel* m, const LauncherTheme& th) {
             table_row_vcenter(lobby_row_h, text_h);
             ImGui::Text("%d / %d", row.player_count, row.max_slots);
             ImGui::TableSetColumnIndex(3);
+            table_row_vcenter(lobby_row_h, text_h);
+            if (row.latency_ms >= 0)
+                ImGui::Text("%d ms", row.latency_ms);
+            else
+                ImGui::TextColored(col(th.text_muted), "—");
+            ImGui::TableSetColumnIndex(4);
             {
                 ImVec2 cell = ImGui::GetCursorScreenPos();
                 const float avail_x = ImGui::GetContentRegionAvail().x;
                 ImGui::SetCursorScreenPos(ImVec2(
                     cell.x + (avail_x - join_btn_w) * 0.5f,
                     cell.y + (lobby_row_h - join_btn_h) * 0.5f));
+                ImGui::BeginDisabled(!launcher_model_netplay_disc_ok(m));
                 if (ImGui::Button("Join", ImVec2(join_btn_w, join_btn_h))) {
-                    m->netplay_selected_lobby = i;
-                    m->netplay_status[0] = '\0';
-                    np_join_selected(m);
+                    if (!launcher_model_netplay_disc_ok(m)) {
+                        std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                                      "%s",
+                                      m->verify.netplay_detail[0]
+                                          ? m->verify.netplay_detail
+                                          : "Mount the supported .cue dump before joining.");
+                    } else {
+                        m->netplay_selected_lobby = i;
+                        m->netplay_status[0] = '\0';
+                        np_join_selected(m);
+                    }
                 }
+                ImGui::EndDisabled();
             }
             ImGui::PopID();
         }
@@ -3396,20 +5849,983 @@ void draw_netplay(LauncherModel* m, const LauncherTheme& th) {
     end_container();
 }
 
+static bool mod_text_matches(const char* search, const RecompLauncherCModPackage& package) {
+    if (!search || !search[0]) return true;
+    std::string needle(search), haystack = std::string(package.name) + " " +
+        package.id + " " + package.author + " " + package.description;
+    std::transform(needle.begin(), needle.end(), needle.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    return haystack.find(needle) != std::string::npos;
+}
+
+static bool mod_feature_text_matches(const char* search,
+                                     const RecompLauncherCModFeature& feature) {
+    if (!search || !search[0]) return true;
+    std::string needle(search), haystack = std::string(feature.name) + " " +
+        feature.id + " " + feature.group + " " + feature.author + " " +
+        feature.description + " " + feature.package_name + " " +
+        feature.package_id + " " + feature.status;
+    std::transform(needle.begin(), needle.end(), needle.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    return haystack.find(needle) != std::string::npos;
+}
+
+static void mod_note_error(LauncherModel* m) {
+    const auto* mods = m ? m->mods : nullptr;
+    const char* error = mods && mods->last_error ? mods->last_error(mods->ctx) : nullptr;
+    std::snprintf(m->mod_status, sizeof(m->mod_status), "%s",
+                  error && error[0] ? error : "The mod operation failed.");
+}
+
+static bool mod_commit_launch(LauncherModel* m) {
+    if (!m || !m->mods || !m->mods->commit ||
+        m->mods->commit(m->mods->ctx, launcher_model_rom_path(m))) {
+        return true;
+    }
+    mod_note_error(m);
+    return false;
+}
+
+struct ModIntegerEditState {
+    int64_t value = 0;
+    std::string provider_value;
+};
+
+static void draw_linkified_mod_author(
+    const char* author_text,
+    const RecompLauncherCModAuthorLink* author_links,
+    int author_link_count,
+    const LauncherTheme& th) {
+    if (!author_text || !author_text[0]) return;
+    const std::string author(author_text);
+    size_t cursor = 0;
+    ImGui::TextColored(col(th.text_muted), "by: ");
+    ImGui::SameLine(0, 0);
+    while (cursor < author.size()) {
+        size_t next = std::string::npos;
+        const RecompLauncherCModAuthorLink* link = nullptr;
+        for (int i = 0; i < author_link_count; ++i) {
+            const auto& candidate = author_links[i];
+            if (!candidate.name[0] || !candidate.url[0]) continue;
+            const size_t found = author.find(candidate.name, cursor);
+            if (found < next) {
+                next = found;
+                link = &candidate;
+            }
+        }
+        if (!link) {
+            ImGui::TextColored(col(th.text_muted), "%s", author.c_str() + cursor);
+            break;
+        }
+        if (next > cursor) {
+            const std::string prefix = author.substr(cursor, next - cursor);
+            ImGui::TextColored(col(th.text_muted), "%s", prefix.c_str());
+            ImGui::SameLine(0, 0);
+        }
+        ImGui::TextLinkOpenURL(link->name, link->url);
+        cursor = next + std::strlen(link->name);
+        if (cursor < author.size()) ImGui::SameLine(0, 0);
+    }
+}
+
+/* Free-text option row shared by the package and feature option paths.
+ * Immediate-mode text editing with external state uses ONE shared edit
+ * buffer: every inactive row re-mirrors its model value before drawing
+ * (so it always displays truth), while the row that owns the keyboard
+ * keeps its typing state. Commit happens when the field deactivates after
+ * an edit; the caller pushes the committed text through set_option, whose
+ * rejection reverts the row to the model value on the next frame. */
+static bool draw_mod_text_option(const RecompLauncherCModOption& option,
+                                 char* next, size_t next_size) {
+    ImGui::TextUnformatted(option.label);
+    ImGui::SameLine(px(260));
+    ImGui::SetNextItemWidth(px(230));
+    static char edit[RECOMP_LAUNCHER_MOD_VALUE_MAX];
+    static ImGuiID owner = 0;
+    const ImGuiID id = ImGui::GetID("##text");
+    if (owner != id)
+        std::snprintf(edit, sizeof(edit), "%s", option.value);
+    ImGui::InputText("##text", edit, sizeof(edit));
+    if (ImGui::IsItemActivated()) owner = id;
+    bool changed = false;
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        std::snprintf(next, next_size, "%s", edit);
+        changed = true;
+    }
+    if (ImGui::IsItemDeactivated() && owner == id) owner = 0;
+    return changed;
+}
+
+static bool draw_mod_integer_option(const RecompLauncherCModOption& option,
+                                    char* next, size_t next_size) {
+    ImGui::TextUnformatted(option.label);
+    ImGui::SameLine(px(260));
+    ImGui::SetNextItemWidth(px(230));
+
+    errno = 0;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(option.value, &end, 10);
+    int64_t provider_value =
+        errno == 0 && end && *end == '\0'
+            ? static_cast<int64_t>(parsed)
+            : option.min_value;
+    provider_value = std::max(
+        option.min_value, std::min(option.max_value, provider_value));
+
+    static std::unordered_map<ImGuiID, ModIntegerEditState> edits;
+    const ImGuiID id = ImGui::GetID("##integer");
+    ModIntegerEditState& edit = edits[id];
+    if (edit.provider_value != option.value) {
+        edit.value = provider_value;
+        edit.provider_value = option.value;
+    }
+
+    const int64_t step = option.step > 0 ? option.step : 1;
+    const bool edited = ImGui::InputScalar(
+        "##integer", ImGuiDataType_S64, &edit.value, &step, nullptr, nullptr,
+        ImGuiInputTextFlags_None);
+    const bool commit = ImGui::IsItemDeactivatedAfterEdit() ||
+                        (edited && !ImGui::IsItemActive());
+    if (!commit) return false;
+
+    edit.value = std::max(
+        option.min_value, std::min(option.max_value, edit.value));
+    const uint64_t distance =
+        static_cast<uint64_t>(edit.value) -
+        static_cast<uint64_t>(option.min_value);
+    edit.value -= static_cast<int64_t>(
+        distance % static_cast<uint64_t>(step));
+    std::snprintf(next, next_size, "%lld",
+                  static_cast<long long>(edit.value));
+    edit.provider_value = next;
+    return true;
+}
+
+static void draw_mod_packages(LauncherModel* m, const LauncherTheme& th) {
+    const auto* mods = m ? m->mods : nullptr;
+    if (!mods || !mods->package_count || !mods->package_get) return;
+    const bool feature_provider =
+        mods->feature_count && mods->feature_get &&
+        mods->feature_option_get && mods->feature_enable &&
+        mods->feature_set_option;
+
+    const char* archive_extension =
+        mods->archive_extension && mods->archive_extension[0]
+            ? mods->archive_extension : ".psxmod";
+    const char* archive_description =
+        mods->archive_description && mods->archive_description[0]
+            ? mods->archive_description
+            : "PSXRecomp mod package (.psxmod)";
+    char install_label[96];
+    char archive_pattern[64];
+    std::snprintf(install_label, sizeof(install_label),
+                  "Install %s", archive_extension);
+    std::snprintf(archive_pattern, sizeof(archive_pattern),
+                  "*%s", archive_extension);
+    if (ImGui::Button(install_label)) {
+        const char* patterns[] = { archive_pattern };
+        char path[1024];
+        if (launcher_pick_file("Install Mod Package", patterns, 1,
+                               archive_description,
+                               path, sizeof(path))) {
+            if (!mods->install_archive || !mods->install_archive(mods->ctx, path))
+                mod_note_error(m);
+            else
+                std::snprintf(m->mod_status, sizeof(m->mod_status),
+                              "Package installed. Changes apply when you press PLAY.");
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(px(300));
+    ImGui::InputTextWithHint("##mod_search", "Search mods and options...",
+                             m->mod_search, sizeof(m->mod_search));
+    if (m->mod_status[0]) {
+        ImGui::SameLine();
+        ImGui::TextColored(col(th.warn), "%s", m->mod_status);
+    }
+    ImGui::Spacing();
+
+    const float list_w = px(300);
+    if (ImGui::BeginChild("##mod_list", ImVec2(list_w, 0), ImGuiChildFlags_Borders)) {
+        const int count = mods->package_count(mods->ctx);
+        int visible = 0;
+        for (int i = 0; i < count; ++i) {
+            RecompLauncherCModPackage package{};
+            if (!mods->package_get(mods->ctx, i, &package) ||
+                !mod_text_matches(m->mod_search, package)) continue;
+            visible++;
+            ImGui::PushID(i);
+            const bool selected = m->mod_package_selected == i;
+            char label[196];
+            if (feature_provider) {
+                std::snprintf(label, sizeof(label), "%s\n%s",
+                              package.name, package.version);
+            } else {
+                std::snprintf(label, sizeof(label), "%s\n%s  %s",
+                              package.name, package.version,
+                              package.enabled ? "[enabled]" : "[disabled]");
+            }
+            if (ImGui::Selectable(label, selected, 0, ImVec2(0, px(52))))
+                m->mod_package_selected = i;
+            if (package.has_error)
+                ImGui::TextColored(col(th.warn), "%s", package.status);
+            ImGui::PopID();
+        }
+        if (!visible) ImGui::TextColored(col(th.text_muted), "No matching packages.");
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    if (ImGui::BeginChild("##mod_detail", ImVec2(0, 0), ImGuiChildFlags_Borders)) {
+        RecompLauncherCModPackage package{};
+        if (mods->package_get(mods->ctx, m->mod_package_selected, &package)) {
+            ImGui::TextColored(col(th.accent2), "%s", package.name);
+            ImGui::SameLine();
+            ImGui::TextColored(col(th.text_muted), "%s", package.version);
+            if (package.author[0])
+                draw_linkified_mod_author(
+                    package.author, package.author_links,
+                    package.author_link_count, th);
+            if (package.description[0]) ImGui::TextWrapped("%s", package.description);
+            if (package.source_url[0]) {
+                ImGui::TextColored(col(th.text_muted), "Source: ");
+                ImGui::SameLine(0, 0);
+                ImGui::TextLinkOpenURL(
+                    package.source_name[0] ? package.source_name : "Project page",
+                    package.source_url);
+            }
+            if (package.license[0])
+                ImGui::TextColored(col(th.text_muted), "License: %s", package.license);
+            ImGui::Spacing();
+
+            if (!feature_provider) {
+                bool enabled = package.enabled != 0;
+                if (ImGui::Checkbox("Enabled", &enabled)) {
+                    if (!mods->set_enabled ||
+                        !mods->set_enabled(mods->ctx, package.id, enabled ? 1 : 0))
+                        mod_note_error(m);
+                }
+            }
+            if (mods->version_count && mods->version_get && mods->select_version) {
+                const int version_count = mods->version_count(mods->ctx, package.id);
+                if (version_count > 1) {
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(px(170));
+                    if (ImGui::BeginCombo("##mod_version", package.version)) {
+                        for (int version_index = 0; version_index < version_count;
+                             ++version_index) {
+                            RecompLauncherCModVersion version{};
+                            if (!mods->version_get(mods->ctx, package.id,
+                                                   version_index, &version)) continue;
+                            if (ImGui::Selectable(version.version,
+                                                  version.selected != 0)) {
+                                if (!mods->select_version(
+                                        mods->ctx, package.id, version.version))
+                                    mod_note_error(m);
+                            }
+                            if (version.selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Select an installed version (rollback)");
+                }
+            }
+            if (package.removable) {
+                ImGui::SameLine();
+                if (ImGui::Button("Remove")) ImGui::OpenPopup("Remove mod package?");
+                if (ImGui::BeginPopupModal("Remove mod package?", nullptr,
+                                           ImGuiWindowFlags_AlwaysAutoResize)) {
+                    ImGui::TextWrapped("Remove %s %s from this installation?",
+                                       package.name, package.version);
+                    if (ImGui::Button("Cancel", ImVec2(px(110), 0)))
+                        ImGui::CloseCurrentPopup();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Remove", ImVec2(px(110), 0))) {
+                        if (!mods->remove_package ||
+                            !mods->remove_package(mods->ctx, package.id, package.version))
+                            mod_note_error(m);
+                        else if (m->mod_package_selected > 0)
+                            m->mod_package_selected--;
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+            }
+            ImGui::Separator();
+
+            std::string last_group;
+            for (int i = 0; !feature_provider && i < package.option_count; ++i) {
+                RecompLauncherCModOption option{};
+                if (!mods->option_get ||
+                    !mods->option_get(mods->ctx, package.id, i, &option)) continue;
+                if (m->mod_search[0]) {
+                    RecompLauncherCModPackage searchable = package;
+                    std::snprintf(searchable.name, sizeof(searchable.name), "%s", option.label);
+                    std::snprintf(searchable.description, sizeof(searchable.description),
+                                  "%s %s", option.description, option.group);
+                    if (!mod_text_matches(m->mod_search, searchable)) continue;
+                }
+                if (last_group != option.group) {
+                    last_group = option.group;
+                    ImGui::Spacing();
+                    ImGui::TextColored(col(th.accent), "%s",
+                                       last_group.empty() ? "General" : last_group.c_str());
+                    ImGui::Separator();
+                }
+                ImGui::PushID(option.id);
+                bool changed = false;
+                char next[RECOMP_LAUNCHER_MOD_VALUE_MAX];
+                std::snprintf(next, sizeof(next), "%s", option.value);
+                if (option.type == RECOMP_MOD_OPTION_BOOLEAN) {
+                    bool value = std::strcmp(option.value, "true") == 0;
+                    if (ImGui::Checkbox(option.label, &value)) {
+                        std::snprintf(next, sizeof(next), "%s", value ? "true" : "false");
+                        changed = true;
+                    }
+                } else if (option.type == RECOMP_MOD_OPTION_CHOICE) {
+                    ImGui::TextUnformatted(option.label);
+                    ImGui::SameLine(px(260));
+                    ImGui::SetNextItemWidth(px(230));
+                    char preview[128];
+                    std::snprintf(preview, sizeof(preview), "%s", option.value);
+                    for (int c = 0; c < option.choice_count; ++c) {
+                        RecompLauncherCModChoice choice{};
+                        if (mods->choice_get &&
+                            mods->choice_get(mods->ctx, package.id, option.id,
+                                             c, &choice) &&
+                            std::strcmp(choice.value, option.value) == 0) {
+                            std::snprintf(preview, sizeof(preview), "%s",
+                                          choice.label[0] ? choice.label
+                                                          : choice.value);
+                            break;
+                        }
+                    }
+                    if (ImGui::BeginCombo("##choice", preview)) {
+                        for (int c = 0; c < option.choice_count; ++c) {
+                            RecompLauncherCModChoice choice{};
+                            if (!mods->choice_get ||
+                                !mods->choice_get(mods->ctx, package.id, option.id, c, &choice))
+                                continue;
+                            const bool selected = std::strcmp(choice.value, option.value) == 0;
+                            if (ImGui::Selectable(choice.label, selected)) {
+                                std::snprintf(next, sizeof(next), "%s", choice.value);
+                                changed = true;
+                            }
+                            if (selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                } else if (option.type == RECOMP_MOD_OPTION_TEXT) {
+                    changed = draw_mod_text_option(
+                        option, next, sizeof(next));
+                } else {
+                    changed = draw_mod_integer_option(
+                        option, next, sizeof(next));
+                }
+                if (ImGui::IsItemHovered() && option.description[0])
+                    ImGui::SetTooltip("%s", option.description);
+                if (changed && (!mods->set_option ||
+                    !mods->set_option(mods->ctx, package.id, option.id, next)))
+                    mod_note_error(m);
+                ImGui::PopID();
+            }
+        } else {
+            ImGui::TextColored(col(th.text_muted),
+                               "Install or select a package to configure it.");
+        }
+    }
+    ImGui::EndChild();
+}
+
+struct ModFeatureListItem {
+    int index;
+    RecompLauncherCModFeature feature;
+};
+
+static bool mod_feature_less(const ModFeatureListItem& lhs,
+                             const ModFeatureListItem& rhs) {
+    const int group = std::strcmp(lhs.feature.group, rhs.feature.group);
+    if (group != 0) return group < 0;
+    const int name = std::strcmp(lhs.feature.name, rhs.feature.name);
+    if (name != 0) return name < 0;
+    const int package = std::strcmp(lhs.feature.package_id, rhs.feature.package_id);
+    if (package != 0) return package < 0;
+    return std::strcmp(lhs.feature.id, rhs.feature.id) < 0;
+}
+
+static void draw_mod_feature_option(LauncherModel* m,
+                                    const RecompLauncherCModFeature& feature,
+                                    const RecompLauncherCModOption& option) {
+    const auto* mods = m->mods;
+    ImGui::PushID(option.id);
+    bool changed = false;
+    char next[RECOMP_LAUNCHER_MOD_VALUE_MAX];
+    std::snprintf(next, sizeof(next), "%s", option.value);
+
+    /* Another option currently overrides this one (e.g. "Instant" ticked makes
+     * a speed box meaningless). Show it, greyed, so the player can see the
+     * value they will get back when they untick -- hiding it would make the
+     * row jump around and lose the setting from view. */
+    const bool inert = option.disabled != 0;
+    if (inert) ImGui::BeginDisabled();
+
+    if (option.type == RECOMP_MOD_OPTION_BOOLEAN) {
+        bool value = std::strcmp(option.value, "true") == 0;
+        if (ImGui::Checkbox(option.label, &value)) {
+            std::snprintf(next, sizeof(next), "%s", value ? "true" : "false");
+            changed = true;
+        }
+    } else if (option.type == RECOMP_MOD_OPTION_CHOICE) {
+        ImGui::TextUnformatted(option.label);
+        ImGui::SameLine(px(260));
+        ImGui::SetNextItemWidth(px(230));
+        char preview[128];
+        std::snprintf(preview, sizeof(preview), "%s", option.value);
+        for (int choice_index = 0; choice_index < option.choice_count;
+             ++choice_index) {
+            RecompLauncherCModChoice choice{};
+            if (mods->feature_choice_get &&
+                mods->feature_choice_get(mods->ctx, feature.package_id,
+                                          feature.id, option.id,
+                                          choice_index, &choice) &&
+                std::strcmp(choice.value, option.value) == 0) {
+                std::snprintf(preview, sizeof(preview), "%s",
+                              choice.label[0] ? choice.label : choice.value);
+                break;
+            }
+        }
+        if (ImGui::BeginCombo("##choice", preview)) {
+            for (int choice_index = 0; choice_index < option.choice_count;
+                 ++choice_index) {
+                RecompLauncherCModChoice choice{};
+                if (!mods->feature_choice_get ||
+                    !mods->feature_choice_get(mods->ctx, feature.package_id,
+                                              feature.id, option.id,
+                                              choice_index, &choice)) {
+                    continue;
+                }
+                const bool selected =
+                    std::strcmp(choice.value, option.value) == 0;
+                if (ImGui::Selectable(choice.label, selected)) {
+                    std::snprintf(next, sizeof(next), "%s", choice.value);
+                    changed = true;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+    } else if (option.type == RECOMP_MOD_OPTION_TEXT) {
+        changed = draw_mod_text_option(option, next, sizeof(next));
+    } else {
+        changed = draw_mod_integer_option(option, next, sizeof(next));
+    }
+
+    const bool hovered = ImGui::IsItemHovered();
+    if (inert) ImGui::EndDisabled();
+
+    if (hovered && option.description[0])
+        ImGui::SetTooltip("%s", option.description);
+    /* A disabled control cannot report a change, but guard anyway so a future
+     * widget that stays interactive can never write through an inert option. */
+    if (changed && !inert &&
+        !mods->feature_set_option(mods->ctx, feature.package_id, feature.id,
+                                  option.id, next)) {
+        mod_note_error(m);
+    }
+    ImGui::PopID();
+}
+
+static void draw_mod_feature_diagnostics(
+    LauncherModel* m, const LauncherTheme& th,
+    const RecompLauncherCModFeature& feature) {
+    const auto* mods = m->mods;
+    if (feature.status[0]) {
+        ImGui::Spacing();
+        ImGui::TextColored(feature.has_error ? col(th.warn) : col(th.text_muted),
+                           "%s", feature.status);
+    }
+    if (!mods->diagnostic_count || !mods->diagnostic_get) return;
+
+    const int count = mods->diagnostic_count(
+        mods->ctx, feature.package_id, feature.id);
+    if (count <= 0) return;
+    ImGui::Spacing();
+    ImGui::TextColored(col(th.accent), "Validation");
+    ImGui::Separator();
+    for (int index = 0; index < count; ++index) {
+        RecompLauncherCModDiagnostic diagnostic{};
+        if (!mods->diagnostic_get(mods->ctx, feature.package_id, feature.id,
+                                  index, &diagnostic)) {
+            continue;
+        }
+        const ImVec4 color = diagnostic.severity == RECOMP_MOD_DIAGNOSTIC_ERROR
+            ? col(th.warn) : col(th.text_muted);
+        ImGui::PushID(index);
+        ImGui::TextColored(color, "%s", diagnostic.message);
+        if (diagnostic.resource[0])
+            ImGui::TextColored(col(th.text_muted), "Resource: %s",
+                               diagnostic.resource);
+        if (diagnostic.related_feature_id[0]) {
+            ImGui::TextColored(
+                col(th.text_muted), "Also involved: %s%s%s",
+                diagnostic.related_package_id,
+                diagnostic.related_package_id[0] ? " / " : "",
+                diagnostic.related_feature_id);
+        }
+        ImGui::PopID();
+    }
+}
+
+static bool set_all_mod_features(LauncherModel* m, bool enabled) {
+    const auto* mods = m ? m->mods : nullptr;
+    if (!mods || !mods->feature_count || !mods->feature_get ||
+        !mods->feature_enable) {
+        return false;
+    }
+
+    const int count = mods->feature_count(mods->ctx);
+    std::vector<RecompLauncherCModFeature> features;
+    features.reserve(count > 0 ? (size_t)count : 0);
+    for (int index = 0; index < count; ++index) {
+        RecompLauncherCModFeature feature{};
+        if (!mods->feature_get(mods->ctx, index, &feature)) {
+            mod_note_error(m);
+            return false;
+        }
+        features.push_back(feature);
+    }
+
+    std::vector<size_t> changed;
+    changed.reserve(features.size());
+    for (size_t index = 0; index < features.size(); ++index) {
+        const RecompLauncherCModFeature& feature = features[index];
+        if ((feature.enabled != 0) == enabled) continue;
+        if (!mods->feature_enable(mods->ctx, feature.package_id, feature.id,
+                                  enabled ? 1 : 0)) {
+            char failure[sizeof(m->mod_status)] = {};
+            const char* error =
+                mods->last_error ? mods->last_error(mods->ctx) : nullptr;
+            if (error && error[0])
+                std::snprintf(failure, sizeof(failure), "%s", error);
+            // Treat the bulk action as one edit. Best-effort rollback prevents
+            // a failed feature from leaving an unexpected half-toggled set.
+            for (auto rollback = changed.rbegin(); rollback != changed.rend();
+                 ++rollback) {
+                const RecompLauncherCModFeature& prior = features[*rollback];
+                mods->feature_enable(mods->ctx, prior.package_id, prior.id,
+                                     prior.enabled ? 1 : 0);
+            }
+            if (failure[0]) {
+                std::snprintf(m->mod_status, sizeof(m->mod_status), "%s",
+                              failure);
+            } else {
+                mod_note_error(m);
+            }
+            return false;
+        }
+        changed.push_back(index);
+    }
+    std::snprintf(m->mod_status, sizeof(m->mod_status),
+                  enabled ? "All mod features enabled. Changes apply on PLAY."
+                          : "All mod features disabled. Changes apply on PLAY.");
+    return true;
+}
+
+static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+    const auto* mods = m ? m->mods : nullptr;
+    if (!mods || !mods->feature_count || !mods->feature_get ||
+        !mods->feature_option_get || !mods->feature_enable ||
+        !mods->feature_set_option) {
+        return;
+    }
+
+    const int feature_count = mods->feature_count(mods->ctx);
+    const char* archive_extension =
+        mods->archive_extension && mods->archive_extension[0]
+            ? mods->archive_extension : ".psxmod";
+    const char* archive_description =
+        mods->archive_description && mods->archive_description[0]
+            ? mods->archive_description
+            : "PSXRecomp mod package (.psxmod)";
+    char install_label[96];
+    char archive_pattern[64];
+    std::snprintf(install_label, sizeof(install_label),
+                  "Install %s", archive_extension);
+    std::snprintf(archive_pattern, sizeof(archive_pattern),
+                  "*%s", archive_extension);
+    if (ImGui::Button(install_label)) {
+        const char* patterns[] = { archive_pattern };
+        char path[1024];
+        if (launcher_pick_file("Install Mod Package", patterns, 1,
+                               archive_description,
+                               path, sizeof(path))) {
+            if (!mods->install_archive ||
+                !mods->install_archive(mods->ctx, path)) {
+                mod_note_error(m);
+            } else {
+                std::snprintf(m->mod_status, sizeof(m->mod_status),
+                              "Package installed. Changes apply when you press PLAY.");
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Enable all"))
+        set_all_mod_features(m, true);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Enable every installed mod feature");
+    ImGui::SameLine();
+    if (ImGui::Button("Disable all"))
+        set_all_mod_features(m, false);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Disable every installed mod feature");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(px(300));
+    ImGui::InputTextWithHint("##mod_search", "Search features, groups, packages...",
+                             m->mod_search, sizeof(m->mod_search));
+    if (m->mod_status[0]) {
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th.warn));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextWrapped("%s", m->mod_status);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+    ImGui::Spacing();
+
+    if (feature_count <= 0) m->mod_selected = 0;
+    else if (m->mod_selected >= feature_count)
+        m->mod_selected = feature_count - 1;
+
+    std::vector<ModFeatureListItem> visible_features;
+    visible_features.reserve(feature_count > 0 ? (size_t)feature_count : 0);
+    for (int index = 0; index < feature_count; ++index) {
+        ModFeatureListItem item{};
+        item.index = index;
+        if (!mods->feature_get(mods->ctx, index, &item.feature) ||
+            !mod_feature_text_matches(m->mod_search, item.feature)) {
+            continue;
+        }
+        visible_features.push_back(item);
+    }
+    std::stable_sort(visible_features.begin(), visible_features.end(),
+                     mod_feature_less);
+
+    const float list_w = px(330);
+    if (ImGui::BeginChild("##mod_feature_list", ImVec2(list_w, 0),
+                          ImGuiChildFlags_Borders)) {
+        size_t first = 0;
+        while (first < visible_features.size()) {
+            const char* raw_group = visible_features[first].feature.group;
+            const char* group = raw_group[0] ? raw_group : "General";
+            size_t last = first + 1;
+            while (last < visible_features.size()) {
+                const char* candidate = visible_features[last].feature.group;
+                if (std::strcmp(raw_group, candidate) != 0) break;
+                ++last;
+            }
+
+            ImGui::PushID(raw_group[0] ? raw_group : "##general");
+            if (m->mod_search[0])
+                ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+            const bool open = ImGui::CollapsingHeader(
+                group, ImGuiTreeNodeFlags_DefaultOpen);
+            if (open) {
+                for (size_t item_index = first; item_index < last; ++item_index) {
+                    const ModFeatureListItem& item = visible_features[item_index];
+                    const RecompLauncherCModFeature& feature = item.feature;
+                    ImGui::PushID(feature.package_id);
+                    ImGui::PushID(feature.id);
+
+                    bool enabled = feature.enabled != 0;
+                    if (ImGui::Checkbox("##enabled", &enabled)) {
+                        if (!mods->feature_enable(
+                                mods->ctx, feature.package_id, feature.id,
+                                enabled ? 1 : 0)) {
+                            mod_note_error(m);
+                        }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s %s", enabled ? "Disable" : "Enable",
+                                          feature.name);
+                    ImGui::SameLine();
+                    if (feature.has_error) {
+                        ImGui::TextColored(col(th.warn), "!");
+                        if (ImGui::IsItemHovered() && feature.status[0])
+                            ImGui::SetTooltip("%s", feature.status);
+                        ImGui::SameLine();
+                    }
+
+                    char label[320];
+                    std::snprintf(label, sizeof(label), "%s\n%s%s%s",
+                                  feature.name,
+                                  feature.package_name[0] ? feature.package_name
+                                                          : feature.package_id,
+                                  feature.package_version[0] ? "  " : "",
+                                  feature.package_version);
+                    if (ImGui::Selectable(
+                            label, m->mod_selected == item.index, 0,
+                            ImVec2(0, px(44)))) {
+                        m->mod_selected = item.index;
+                    }
+                    ImGui::PopID();
+                    ImGui::PopID();
+                }
+            }
+            ImGui::PopID();
+            first = last;
+        }
+        if (visible_features.empty()) {
+            ImGui::TextColored(col(th.text_muted),
+                               feature_count ? "No matching features."
+                                             : "No mod features installed.");
+        }
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    if (ImGui::BeginChild("##mod_feature_detail", ImVec2(0, 0),
+                          ImGuiChildFlags_Borders)) {
+        RecompLauncherCModFeature feature{};
+        if (feature_count > 0 &&
+            mods->feature_get(mods->ctx, m->mod_selected, &feature)) {
+            ImGui::TextColored(col(th.accent2), "%s", feature.name);
+            if (feature.group[0]) {
+                ImGui::SameLine();
+                ImGui::TextColored(col(th.text_muted), "%s", feature.group);
+            }
+            ImGui::TextColored(
+                col(th.text_muted), "From %s%s%s",
+                feature.package_name[0] ? feature.package_name
+                                        : feature.package_id,
+                feature.package_version[0] ? " " : "",
+                feature.package_version);
+            if (feature.author[0])
+                draw_linkified_mod_author(
+                    feature.author, feature.author_links,
+                    feature.author_link_count, th);
+            if (feature.source_url[0]) {
+                ImGui::TextColored(col(th.text_muted), "Source: ");
+                ImGui::SameLine(0, 0);
+                ImGui::TextLinkOpenURL(
+                    feature.source_name[0] ? feature.source_name : "Project page",
+                    feature.source_url);
+            }
+            if (feature.description[0])
+                ImGui::TextWrapped("%s", feature.description);
+            ImGui::Spacing();
+
+            if (feature.camera_controls) {
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextColored(col(th.accent), "3D camera controls");
+                ImGui::TextWrapped(
+                    feature.enabled
+                        ? "This mod adds live camera input. Review the current "
+                          "right-stick and keyboard bindings before playing."
+                        : "Enable this feature to expose its camera bindings "
+                          "on the Controller page.");
+                if (feature.enabled &&
+                    ImGui::Button("Review Camera Bindings")) {
+                    launcher_model_open_config(m, 0);
+                }
+                ImGui::Spacing();
+            }
+
+            // The list-row checkbox is the single enable/disable control.
+            // The detail pane owns configuration values only.
+            if (mods->feature_resource_count &&
+                mods->feature_resource_get &&
+                mods->feature_resource_set_path) {
+                const int resource_count = mods->feature_resource_count(
+                    mods->ctx, feature.package_id, feature.id);
+                if (resource_count > 0) {
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+                    ImGui::TextColored(col(th.accent), "Required owner files");
+                    for (int resource_index = 0;
+                         resource_index < resource_count; ++resource_index) {
+                        RecompLauncherCModResource resource{};
+                        if (!mods->feature_resource_get(
+                                mods->ctx, feature.package_id, feature.id,
+                                resource_index, &resource))
+                            continue;
+                        ImGui::PushID(resource.id);
+                        ImGui::TextUnformatted(resource.label);
+                        if (resource.description[0])
+                            ImGui::TextWrapped("%s", resource.description);
+                        ImGui::TextColored(
+                            resource.verified ? col(th.accent2) : col(th.warn),
+                            "%s", resource.status[0]
+                                      ? resource.status : "Not selected");
+                        if (resource.path[0]) {
+                            const char* basename = resource.path;
+                            for (const char* p = resource.path; *p; ++p)
+                                if (*p == '/' || *p == '\\') basename = p + 1;
+                            ImGui::TextColored(col(th.text_muted), "%s", basename);
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", resource.path);
+                        }
+                        const bool directory_resource =
+                            std::strcmp(resource.format, "directory") == 0 ||
+                            std::strcmp(resource.format, "folder") == 0;
+                        if (ImGui::Button(
+                                resource.path[0]
+                                    ? (directory_resource ? "Change folder"
+                                                          : "Change file")
+                                    : (directory_resource ? "Select folder"
+                                                          : "Select file"))) {
+                            std::vector<std::string> owned_patterns;
+                            std::vector<const char*> patterns;
+                            std::string remaining = resource.file_patterns;
+                            size_t start = 0;
+                            while (start <= remaining.size()) {
+                                const size_t comma = remaining.find(',', start);
+                                std::string pattern = remaining.substr(
+                                    start, comma == std::string::npos
+                                               ? std::string::npos
+                                               : comma - start);
+                                if (!pattern.empty())
+                                    owned_patterns.push_back(pattern);
+                                if (comma == std::string::npos) break;
+                                start = comma + 1;
+                            }
+                            for (const std::string& pattern : owned_patterns)
+                                patterns.push_back(pattern.c_str());
+                            char path[RECOMP_LAUNCHER_MOD_PATH_MAX] = {};
+                            const bool picked = directory_resource
+                                ? launcher_pick_folder(resource.label, path,
+                                                       sizeof(path))
+                                : launcher_pick_file(
+                                      resource.label,
+                                      patterns.empty() ? nullptr : patterns.data(),
+                                      (int)patterns.size(),
+                                      resource.file_description[0]
+                                          ? resource.file_description : nullptr,
+                                      path, sizeof(path));
+                            if (picked) {
+                                if (!mods->feature_resource_set_path(
+                                        mods->ctx, feature.package_id,
+                                        feature.id, resource.id, path)) {
+                                    mod_note_error(m);
+                                } else {
+                                    std::snprintf(
+                                        m->mod_status,
+                                        sizeof(m->mod_status),
+                                        "%s verified. Changes apply on PLAY.",
+                                        resource.label);
+                                }
+                            }
+                        }
+                        ImGui::PopID();
+                        ImGui::Spacing();
+                    }
+                }
+            }
+            draw_mod_feature_diagnostics(m, th, feature);
+            if (feature.option_count > 0) {
+                ImGui::Spacing();
+                ImGui::Separator();
+            }
+            std::string last_group;
+            for (int index = 0; index < feature.option_count; ++index) {
+                RecompLauncherCModOption option{};
+                if (!mods->feature_option_get(
+                        mods->ctx, feature.package_id, feature.id,
+                        index, &option)) {
+                    continue;
+                }
+                if (last_group != option.group) {
+                    last_group = option.group;
+                    ImGui::Spacing();
+                    ImGui::TextColored(
+                        col(th.accent), "%s",
+                        last_group.empty() ? "Configuration"
+                                           : last_group.c_str());
+                    ImGui::Separator();
+                }
+                draw_mod_feature_option(m, feature, option);
+            }
+        } else {
+            ImGui::TextColored(col(th.text_muted),
+                               "Install or select a feature to configure it.");
+        }
+    }
+    ImGui::EndChild();
+}
+
+void draw_mods(LauncherModel* m, const LauncherTheme& th) {
+    const auto* mods = m ? m->mods : nullptr;
+    if (!mods) return;
+    const bool feature_provider =
+        mods->feature_count && mods->feature_get &&
+        mods->feature_option_get && mods->feature_enable &&
+        mods->feature_set_option;
+    if (!feature_provider) m->mod_show_packages = true;
+
+    if (feature_provider) {
+        if (ImGui::RadioButton("Features", !m->mod_show_packages))
+            m->mod_show_packages = false;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Installed packages", m->mod_show_packages))
+            m->mod_show_packages = true;
+        ImGui::Spacing();
+    }
+
+    if (m->mod_show_packages)
+        draw_mod_packages(m, th);
+    else
+        draw_mod_features(m, th);
+}
+
 // ---- panel registry: id -> {view, slot, available, draw} --------------------
 // The single implementation table for every panel this backend draws. A
 // SystemProfile's panels_dashboard/panels_settings/panels_controller arrays
 // (launcher_system.h) list which of these ids compose into each view, in
 // slot order; draw_dashboard/draw_settings/draw_controller above look each id
 // up here via find_composed() and draw whatever's both listed and available().
+// Online identity card (dashboard, under the controller card). Double
+// opt-in like the BIOS row: the console profile must LIST "identity" in
+// panels_dashboard AND the game must set GameInfo.has_player_name — most
+// titles have no online play and never see this card (owner directive:
+// shared launcher features are per-game opt-in).
+int avail_identity(const LauncherModel* m) { return m->has_player_name; }
+void panel_identity_draw(LauncherModel* m, const LauncherTheme* th) {
+    if (!begin_panel("identity")) { end_panel(); return; }
+    eyebrow("ONLINE");
+    const float cw = ImGui::GetContentRegionAvail().x;
+    ImGui::TextUnformatted("Player name");
+    ImGui::SetNextItemWidth(cw);
+    ImGui::InputTextWithHint("##identity_name", "console default",
+                             m->s.player_name, sizeof(m->s.player_name));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "The name other players see online (the console nickname). "
+            "Leave empty for the default.");
+    if (m->identity_detail && m->identity_detail[0]) {
+        ImGui::Dummy(ImVec2(0, px(4)));
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th->text_muted));
+        ImGui::TextWrapped("%s", m->identity_detail);
+        ImGui::PopStyleColor();
+    }
+    end_panel();
+}
+
 const LauncherPanel kPanelRegistry[] = {
     { "game",              LNG_VIEW_DASHBOARD,  LNG_SLOT_MAIN, nullptr,      panel_game_draw },
     { "controller",        LNG_VIEW_DASHBOARD,  LNG_SLOT_SIDE, nullptr,      panel_controller_draw },
+    { "identity",          LNG_VIEW_DASHBOARD,  LNG_SLOT_SIDE, avail_identity, panel_identity_draw },
     { "save",              LNG_VIEW_DASHBOARD,  LNG_SLOT_WIDE, avail_save,   panel_save_draw },
     { "tpak",              LNG_VIEW_DASHBOARD,  LNG_SLOT_WIDE, avail_tpak,   panel_tpak_draw },
     { "video",             LNG_VIEW_SETTINGS,   LNG_SLOT_MAIN, nullptr,      panel_video_draw },
     { "audio",             LNG_VIEW_SETTINGS,   LNG_SLOT_SIDE, nullptr,      panel_audio_draw },
+    { "input",             LNG_VIEW_SETTINGS,   LNG_SLOT_SIDE, avail_input,  panel_input_draw },
     { "system",            LNG_VIEW_SETTINGS,   LNG_SLOT_SIDE, avail_system, panel_system_draw },
+    { "solar",             LNG_VIEW_SETTINGS,   LNG_SLOT_SIDE, avail_solar,  panel_solar_draw },
     { "hotkeys",           LNG_VIEW_SETTINGS,   LNG_SLOT_WIDE, nullptr,      panel_hotkeys_draw },
     { "controller_config", LNG_VIEW_CONTROLLER, LNG_SLOT_WIDE, nullptr,      panel_controller_config_draw },
     { nullptr,              LNG_VIEW_DASHBOARD,  0,             nullptr,      nullptr },   // sentinel
@@ -3442,14 +6858,30 @@ void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
         ImGui::SetCursorScreenPos(ImVec2(origin.x, cta_y + (play_h - ImGui::GetFrameHeight()) * 0.5f));
         if (ImGui::Checkbox("Skip launcher on boot", &skip))
             launcher_model_request_skip_toggle(m);
+    } else if (m->view == LNG_VIEW_SETTINGS &&
+               launcher_model_can_restore_defaults(m)) {
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x, cta_y + (play_h - px(34.0f)) * 0.5f));
+        if (ImGui::Button("Restore Defaults", ImVec2(px(150.0f), px(34.0f))))
+            launcher_model_request_restore_defaults(m);
     }
     if (m->view == LNG_VIEW_NETPLAY) {
         const float action_w = px(190.0f);
         const float settings_w = px(170.0f);
         const float refresh_w = px(120.0f);
         const float gap = px(10);
-        ImGui::SetCursorScreenPos(ImVec2(origin.x, cta_y));
-        if (ImGui::Button("Host Lobby", ImVec2(action_w, play_h))) {
+        const float row_need =
+            action_w + gap + settings_w + gap + refresh_w + gap + action_w;
+        const bool compact = fullw < row_need + px(8);
+
+        auto open_host = [&]() {
+            if (!launcher_model_netplay_disc_ok(m)) {
+                const char* why = m->verify.netplay_detail[0]
+                                      ? m->verify.netplay_detail
+                                      : "Mount the supported .cue dump before hosting.";
+                std::snprintf(m->netplay_status, sizeof(m->netplay_status), "%s", why);
+                return;
+            }
             if (!m->s.netplay_player_name[0]) {
                 m->netplay_name_modal_open = true;
                 return;
@@ -3463,25 +6895,62 @@ void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
             }
             m->netplay_host_password[0] = '\0';
             m->netplay_host_modal_open = true;
-        }
-        ImGui::SetCursorScreenPos(ImVec2(origin.x + action_w + gap, cta_y));
-        if (ImGui::Button("Network Settings", ImVec2(settings_w, play_h))) {
+        };
+        auto open_network = [&]() {
             const auto* np = np_cb(m);
             const char* current = np && np->default_url ? np->default_url(np->ctx) : "";
             std::snprintf(m->netplay_lobby_url, sizeof(m->netplay_lobby_url), "%s",
                           current ? current : "");
             m->netplay_network_modal_open = true;
-        }
-        ImGui::SetCursorScreenPos(
-            ImVec2(origin.x + action_w + gap + settings_w + gap, cta_y));
-        if (ImGui::Button("Refresh", ImVec2(refresh_w, play_h))) {
-            np_refresh_lobby_list(m);
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Reload server lobbies and rescan LAN/Direct IP");
-        ImGui::SetCursorScreenPos(ImVec2(origin.x + fullw - action_w, cta_y));
-        if (ImGui::Button("Join Direct", ImVec2(action_w, play_h))) {
-            m->netplay_direct_modal_open = true;
+        };
+
+        if (!compact) {
+            ImGui::SetCursorScreenPos(ImVec2(origin.x, cta_y));
+            if (ImGui::Button("Host Lobby", ImVec2(action_w, play_h)))
+                open_host();
+            ImGui::SetCursorScreenPos(ImVec2(origin.x + action_w + gap, cta_y));
+            if (ImGui::Button("Network Settings", ImVec2(settings_w, play_h)))
+                open_network();
+            ImGui::SetCursorScreenPos(
+                ImVec2(origin.x + action_w + gap + settings_w + gap, cta_y));
+            if (ImGui::Button("Refresh", ImVec2(refresh_w, play_h)))
+                np_refresh_lobby_list(m);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Reload server lobbies and rescan LAN/Direct IP");
+            ImGui::SetCursorScreenPos(ImVec2(origin.x + fullw - action_w, cta_y));
+            if (ImGui::Button("Join Direct", ImVec2(action_w, play_h)))
+                m->netplay_direct_modal_open = true;
+        } else {
+            /* Narrow window: collapse into a scrollable Actions menu. */
+            const float menu_btn_w = px(160.0f);
+            ImGui::SetCursorScreenPos(ImVec2(origin.x, cta_y));
+            if (ImGui::Button("Actions##np_footer", ImVec2(menu_btn_w, play_h)))
+                ImGui::OpenPopup("##netplay_footer_menu");
+            if (ImGui::BeginPopup("##netplay_footer_menu")) {
+                const float menu_w = px(220.0f);
+                const float menu_h = px(168.0f);
+                if (ImGui::BeginChild("##np_footer_scroll", ImVec2(menu_w, menu_h),
+                                      ImGuiChildFlags_None,
+                                      ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+                    if (ImGui::Selectable("Host Lobby")) {
+                        open_host();
+                    }
+                    if (ImGui::Selectable("Network Settings")) {
+                        open_network();
+                    }
+                    if (ImGui::Selectable("Refresh")) {
+                        np_refresh_lobby_list(m);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Reload server lobbies and rescan LAN/Direct IP");
+                    if (ImGui::Selectable("Join Direct")) {
+                        m->netplay_direct_modal_open = true;
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::EndPopup();
+            }
         }
         return;
     }
@@ -3498,19 +6967,877 @@ void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
         ImGui::IsKeyPressed(ImGuiKey_Backspace, false))
         ImGui::SetKeyboardFocusHere();
     float play_x = origin.x + fullw - play_w;
-    if (m->view == LNG_VIEW_DASHBOARD && m->netplay_supported) {
+    if (m->netplay_supported &&
+        (m->view == LNG_VIEW_DASHBOARD || m->view == LNG_VIEW_SETTINGS ||
+         m->view == LNG_VIEW_CONTROLLER)) {
         const float net_w = px(170.0f);
         ImGui::SetCursorScreenPos(ImVec2(play_x - net_w - px(12.0f), cta_y));
         if (ImGui::Button("NETPLAY", ImVec2(net_w, play_h))) {
-            np_connect_and_list(m);
+            /* Open the page immediately; connect/list runs on first draw
+             * (and continues off-thread) so Windows DNS/TCP never freezes UI. */
+            m->netplay_list_fresh = false;
+            std::snprintf(m->netplay_status, sizeof(m->netplay_status),
+                          "Connecting to lobby server…");
             launcher_model_set_view(m, LNG_VIEW_NETPLAY);
         }
     }
     ImGui::SetCursorScreenPos(ImVec2(play_x, cta_y));
-    if (neon_cta("##play", "PLAY", ImVec2(play_w, play_h)))
-        m->action = LNG_ACTION_LAUNCH;
+    const bool can_play = launcher_model_can_launch(m);
+    const bool bios_block = launcher_model_bios_blocks_play(m);
+    const bool play_enabled = can_play || bios_block;
+    if (neon_cta("##play", "PLAY", ImVec2(play_w, play_h), play_enabled)) {
+        /* Prefer mismatch prompt over launch even if can_play races true. */
+        if (bios_block)
+            launcher_model_bios_play_prompt(m);
+        else if (mod_commit_launch(m))
+            m->action = LNG_ACTION_LAUNCH;
+    } else if (!play_enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        const char* noun = m->rom_noun ? m->rom_noun : "ROM";
+        if (m->has_bios && !m->setup_bios_ok) {
+            ImGui::SetTooltip(
+                "Select a valid BIOS first (or Use OpenBIOS when this build "
+                "allows it).");
+        } else if (!m->rom_present || strcmp(m->rom_size, "--") == 0) {
+            ImGui::SetTooltip("Select a valid %s first", noun);
+        } else if (m->profile && m->profile->verify.mode == 1 &&
+                   (m->verify.verdict == 0 || m->verify.verdict == 3)) {
+            ImGui::SetTooltip("Select a verified %s first", noun);
+        } else if (m->setup_preparing) {
+            ImGui::SetTooltip("Wait for the current setup job to finish");
+        } else {
+            ImGui::SetTooltip("Select a valid %s first", noun);
+        }
+    }
+    if (!play_enabled && ImGui::IsItemClicked() && m->setup_wizard_supported)
+        m->setup_wizard_open = true;
     ImGui::SetItemDefaultFocus();   // gamepad/keyboard start on the primary action
     (void)win;
+}
+
+/* Compact progress-only modal while a setup job runs — closes the full
+ * first-run form so nothing else is interactive. */
+enum SetupPlatKind {
+    SETUP_PLAT_GENERIC = 0,
+    SETUP_PLAT_PSX,
+    SETUP_PLAT_GBA,
+    SETUP_PLAT_SNES,
+};
+
+static bool setup_plat_contains_ci(const char* hay, const char* needle) {
+    if (!hay || !needle || !needle[0]) return false;
+    for (const char* h = hay; *h; ++h) {
+        const char* a = h;
+        const char* b = needle;
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+            if (ca != cb) break;
+            ++a;
+            ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+static SetupPlatKind setup_platform_kind(const char* platform) {
+    if (setup_plat_contains_ci(platform, "PLAYSTATION") ||
+        setup_plat_contains_ci(platform, "PSX") ||
+        setup_plat_contains_ci(platform, "PS1"))
+        return SETUP_PLAT_PSX;
+    if (setup_plat_contains_ci(platform, "GAME BOY ADVANCE") ||
+        setup_plat_contains_ci(platform, "GBA"))
+        return SETUP_PLAT_GBA;
+    if (setup_plat_contains_ci(platform, "SUPER NINTENDO") ||
+        setup_plat_contains_ci(platform, "SNES"))
+        return SETUP_PLAT_SNES;
+    return SETUP_PLAT_GENERIC;
+}
+
+static const char* kRetcommToolchainsUrl =
+    "https://github.com/TechnicallyComputers/retcomm-toolchains";
+static const char* kRetcommToolchainsReleasesUrl =
+    "https://github.com/TechnicallyComputers/retcomm-toolchains/releases";
+
+/* TextLinkOpenURL is 1.91+; HOST_IMGUI may be older — fall back to a button. */
+static void setup_url_link(const char* label, const char* url) {
+#if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 19100
+    ImGui::TextLinkOpenURL(label, url);
+#else
+    if (ImGui::SmallButton(label))
+        SDL_OpenURL(url);
+#endif
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", url);
+}
+
+/* Compact progress-only modal while a setup job runs — closes the full
+ * first-run form so nothing else is interactive. */
+static void draw_setup_progress_modal(LauncherModel* m, const LauncherTheme& th) {
+    static const char* kProgPopup = "Setup progress";
+    ImGui::OpenPopup(kProgPopup);
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(px(480), 0), ImGuiCond_Always);
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
+    if (!ImGui::BeginPopupModal(kProgPopup, nullptr, flags))
+        return;
+
+    const float wrap_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    const char* game =
+        (m->game_name && m->game_name[0]) ? m->game_name : "this game";
+    const char* job =
+        (m->setup_progress_title[0])
+            ? m->setup_progress_title
+            : ((m->prepare_disc_label && m->prepare_disc_label[0])
+                   ? m->prepare_disc_label
+                   : "Setup");
+    ImGui::TextColored(col(th.accent), "%s", job);
+    ImGui::PushTextWrapPos(wrap_x);
+    ImGui::TextColored(col(th.text_muted),
+                       "Please wait — %s is working. Do not close this window.",
+                       game);
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, px(14)));
+
+    ImGui::PushTextWrapPos(wrap_x);
+    const char* st = m->setup_status[0] ? m->setup_status : "Working…";
+    const bool warn_st =
+        (strncmp(st, "WARNING", 7) == 0) ||
+        (strstr(st, "Do not close") != nullptr) ||
+        (strstr(st, "DO NOT") != nullptr);
+    if (warn_st) {
+        ImGui::PushStyleColor(ImGuiCol_Text, col(th.warn));
+        ImGui::TextWrapped("%s", st);
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::TextColored(col(th.accent), "%s", st);
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, px(8)));
+    const float bar = (m->setup_prepare_fraction >= 0.0f)
+                          ? m->setup_prepare_fraction
+                          : m->setup_prepare_pulse;
+    ImGui::ProgressBar(bar, ImVec2(-1.0f, px(14)), "");
+
+    if (m->setup_error[0]) {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        ImGui::PushTextWrapPos(wrap_x);
+        ImGui::TextColored(col(th.warn), "%s", m->setup_error);
+        ImGui::PopTextWrapPos();
+    }
+
+    ImGui::EndPopup();
+    /* Esc / outside click must not dismiss while the job is running. */
+    if (m->setup_preparing && !ImGui::IsPopupOpen(kProgPopup))
+        ImGui::OpenPopup(kProgPopup);
+}
+
+void draw_setup_wizard_modal(LauncherModel* m, const LauncherTheme& th) {
+    if (!m->setup_wizard_supported) return;
+    if (!m->setup_wizard_open && !m->setup_preparing) return;
+    launcher_model_poll_prepare_disc(m);
+
+    /* While a prepare/rebuild/toolchain job runs, show only the progress window.
+     * Skipping BeginPopupModal on "First-run setup" lets ImGui dismiss it. */
+    if (m->setup_preparing) {
+        draw_setup_progress_modal(m, th);
+        return;
+    }
+
+    ImGui::OpenPopup("First-run setup");
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    // Auto-sized setup content changes height as validation details appear.
+    // Recenter against its current size every frame so it cannot drift or clip.
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    /* Prefer content height (AlwaysAutoResize). Clamp to the work area. */
+    const float max_h = vp->WorkSize.y * 0.92f;
+    ImGui::SetNextWindowSize(
+        ImVec2(px(g_rom_picker.active && g_rom_picker.from_setup ? 720.0f : 640.0f), 0),
+        ImGuiCond_Always);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(px(520), 0),
+                                        ImVec2(FLT_MAX, max_h));
+    if (!ImGui::BeginPopupModal("First-run setup", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize |
+                                ImGuiWindowFlags_NoMove))
+        return;
+
+    const float wrap_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    const char* noun = (m->rom_noun && m->rom_noun[0]) ? m->rom_noun : "ROM";
+    const char* game = (m->game_name && m->game_name[0]) ? m->game_name : "this game";
+    if (g_rom_picker.active && g_rom_picker.from_setup) {
+        draw_builtin_rom_picker_contents(m, th, false);
+        ImGui::EndPopup();
+        return;
+    }
+
+    /* ---- Page 0: portable toolchain ------------------------------------ */
+    if (m->setup_needs_toolchain && m->setup_page == 0) {
+        const bool want_update =
+            m->setup_tc_ready && m->setup_tc_update_available &&
+            !m->setup_tc_update_skipped;
+        ImGui::TextColored(col(th.accent),
+                           want_update ? "Toolchain update" : "Build tools");
+        ImGui::PushTextWrapPos(wrap_x);
+        if (want_update) {
+            ImGui::TextColored(col(th.text_muted),
+                "%s found a newer portable cmake/clang pack. Update now "
+                "(recommended), keep your current install for this session, "
+                "or install from an offline zip.",
+                game);
+        } else {
+            ImGui::TextColored(col(th.text_muted),
+                "%s builds game sources on your machine. Install the portable "
+                "cmake/clang pack (cmake-clang-v1), or provide a matching zip "
+                "for offline setup.",
+                game);
+        }
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, px(12)));
+
+        ImGui::TextUnformatted("1. Portable toolchain");
+        ImGui::PushTextWrapPos(wrap_x);
+        ImGui::TextColored(col(th.text_muted),
+            "Automatic download pulls the latest cmake-clang-v1 release and "
+            "caches it for reuse across titles (no per-game version pin). "
+            "Uncheck to browse a local zip instead "
+            "(for offline machines, grab a release asset from the repo below).");
+        ImGui::PopTextWrapPos();
+        if (want_update || m->setup_tc_local_ver[0] ||
+            m->setup_tc_remote_ver[0]) {
+            ImGui::Dummy(ImVec2(0, px(4)));
+            char ver_line[160];
+            std::snprintf(
+                ver_line, sizeof(ver_line), "Installed: %s   Latest: %s",
+                m->setup_tc_local_ver[0] ? m->setup_tc_local_ver : "—",
+                m->setup_tc_remote_ver[0] ? m->setup_tc_remote_ver : "—");
+            ImGui::TextColored(col(want_update ? th.warn : th.good), "%s",
+                               ver_line);
+        }
+        ImGui::Dummy(ImVec2(0, px(4)));
+        ImGui::TextColored(col(th.text_muted), "Source / manual download:");
+        ImGui::SameLine();
+        setup_url_link("TechnicallyComputers/retcomm-toolchains",
+                       kRetcommToolchainsUrl);
+        ImGui::Dummy(ImVec2(0, px(6)));
+
+        if (ImGui::Checkbox(want_update
+                                ? "Download toolchain update##tc"
+                                : "Download latest portable toolchain##tc",
+                            &m->setup_tc_auto)) {
+            if (m->setup_tc_auto)
+                m->setup_error[0] = '\0';
+        }
+
+        if (!m->setup_tc_auto) {
+            ImGui::Dummy(ImVec2(0, px(8)));
+            ImGui::TextUnformatted("Toolchain zip");
+            ImGui::PushTextWrapPos(wrap_x);
+            ImGui::TextColored(col(th.text_muted),
+                "Select a cmake-clang-v1-*.zip from "
+                "TechnicallyComputers/retcomm-toolchains releases.");
+            ImGui::PopTextWrapPos();
+            setup_url_link("Open retcomm-toolchains releases",
+                           kRetcommToolchainsReleasesUrl);
+            ImGui::Dummy(ImVec2(0, px(4)));
+            const char* zp = m->setup_tc_zip[0] ? m->setup_tc_zip
+                                                : "(none selected)";
+            char zelided[220];
+            elide_left(zp, px(320), zelided, sizeof(zelided));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(col(m->setup_tc_zip[0] ? th.good : th.warn), "%s",
+                               m->setup_tc_zip[0] ? "OK" : "Needed");
+            ImGui::SameLine();
+            ImGui::TextColored(
+                col(m->setup_tc_zip[0] ? th.text : th.text_muted), "%s",
+                zelided);
+            ImGui::SameLine();
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(12), px(6)));
+            if (ImGui::Button("Browse zip…##tc", ImVec2(px(128), px(32)))) {
+                static const char* kZipPatterns[] = {"*.zip"};
+                request_file_picker(
+                    m, BuiltinPickerKind::SetupToolchainZip,
+                    "Select cmake-clang-v1 toolchain zip", kZipPatterns, 1,
+                    "Toolchain zip archives", true);
+            }
+            ImGui::PopStyleVar();
+        }
+
+        if (m->setup_status[0]) {
+            ImGui::Dummy(ImVec2(0, px(8)));
+            ImGui::PushTextWrapPos(wrap_x);
+            ImGui::TextColored(col(th.good), "%s", m->setup_status);
+            ImGui::PopTextWrapPos();
+        }
+        if (m->setup_error[0]) {
+            ImGui::Dummy(ImVec2(0, px(6)));
+            ImGui::PushTextWrapPos(wrap_x);
+            ImGui::TextColored(col(th.warn), "%s", m->setup_error);
+            ImGui::PopTextWrapPos();
+        }
+
+        ImGui::Dummy(ImVec2(0, px(14)));
+        const bool can_next = launcher_model_can_advance_toolchain(m);
+        if (!can_next) ImGui::BeginDisabled();
+        if (ImGui::Button(want_update ? "Update##tc_next" : "Next##tc_next",
+                          ImVec2(px(140), px(34)))) {
+            launcher_model_start_ensure_toolchain(m);
+            if (m->setup_preparing) {
+                ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+                draw_setup_progress_modal(m, th);
+                return;
+            }
+        }
+        if (!can_next) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(
+                    "Enable automatic download or select a toolchain zip");
+        }
+        if (want_update) {
+            ImGui::SameLine();
+            if (ImGui::Button("Skip for now##tc_skip", ImVec2(px(140), px(34))))
+                launcher_model_skip_toolchain_update(m);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Keep the installed toolchain for this session.");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Quit", ImVec2(px(100), px(34))))
+            m->action = LNG_ACTION_QUIT;
+
+        if (m->setup_wizard_open && !ImGui::IsPopupOpen("First-run setup"))
+            ImGui::OpenPopup("First-run setup");
+        ImGui::EndPopup();
+        return;
+    }
+
+    /* ---- Page 1: BIOS / disc / generate -------------------------------- */
+    const SetupPlatKind plat = setup_platform_kind(m->platform);
+    const bool media_confirm = launcher_model_setup_media_confirm_only(m);
+
+    if (media_confirm) {
+        ImGui::TextColored(col(th.accent),
+                           m->has_bios ? "Confirm BIOS and disc"
+                                       : "Confirm disc");
+        ImGui::PushTextWrapPos(wrap_x);
+        if (plat == SETUP_PLAT_PSX && m->has_bios) {
+            ImGui::TextColored(col(th.text_muted),
+                "This build is already generated. Select a PlayStation BIOS "
+                "(or keep OpenBIOS) and a Redump-style .cue with sibling .bin "
+                "tracks so %s can launch. Your previous disc/BIOS picks were "
+                "cleared from settings.",
+                game);
+        } else if (m->has_bios) {
+            ImGui::TextColored(col(th.text_muted),
+                "This build is already ready. Confirm a BIOS image and a "
+                "playable %s below — previous picks were cleared from settings.",
+                noun);
+        } else {
+            ImGui::TextColored(col(th.text_muted),
+                "This build is already ready. Confirm a playable %s below — "
+                "the previous pick was cleared from settings.",
+                noun);
+        }
+        ImGui::PopTextWrapPos();
+    } else {
+        ImGui::TextColored(col(th.accent), "Setup required");
+        ImGui::PushTextWrapPos(wrap_x);
+        if (plat == SETUP_PLAT_PSX && m->has_bios) {
+            ImGui::TextColored(col(th.text_muted),
+                "%s needs a playable %s before you can launch. This build includes "
+                "a bundled BIOS (OpenBIOS) by default. Setup also looks for a "
+                "retail SCPH1001.BIN beside the install and uses it when found; "
+                "otherwise OpenBIOS stays selected. Use a Redump-style .cue with "
+                "sibling .bin tracks (.iso is not accepted). Pick your %s below "
+                "(you must legally own these dumps).",
+                game, noun, noun);
+        } else if (plat == SETUP_PLAT_GBA && m->has_bios) {
+            ImGui::TextColored(col(th.text_muted),
+                "%s needs a Game Boy Advance BIOS dump and a playable %s before "
+                "you can launch. Pick both below (you must legally own these dumps).",
+                game, noun);
+        } else if (plat == SETUP_PLAT_SNES) {
+            ImGui::TextColored(col(th.text_muted),
+                "%s needs a playable Super Nintendo %s before you can launch. "
+                "Pick your file below (you must legally own this dump).",
+                game, noun);
+        } else if (m->has_bios) {
+            ImGui::TextColored(col(th.text_muted),
+                "%s needs a BIOS image and a playable %s before you can launch. "
+                "Pick both below (you must legally own these dumps).",
+                game, noun);
+        } else {
+            ImGui::TextColored(col(th.text_muted),
+                "%s needs a playable %s before you can launch. Pick your file below "
+                "(you must legally own this dump).",
+                game, noun);
+        }
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::Dummy(ImVec2(0, px(10)));
+
+    if (m->has_bios) {
+        const bool has_pick = m->s.bios_path[0] != 0;
+        const bool offers_bundled = (plat == SETUP_PLAT_PSX);
+        const char* bios_section =
+            (plat == SETUP_PLAT_GBA) ? "1. GBA BIOS (required)"
+            : (plat == SETUP_PLAT_PSX) ? "1. PlayStation BIOS (optional)"
+                                      : "1. BIOS";
+        const char* bios_help =
+            (plat == SETUP_PLAT_GBA)
+                ? "Browse for your gba_bios.bin dump (16 KB, SHA-1 "
+                  "300c20df… — dumped from a Game Boy Advance). Setup packages "
+                  "do not ship a redistributable GBA BIOS."
+            : (plat == SETUP_PLAT_PSX)
+                ? "Default: bundled OpenBIOS. Setup auto-selects SCPH1001.BIN "
+                  "if it finds a validated dump beside the install; otherwise "
+                  "browse for your own (exactly 512 KB)."
+                : "Browse for a BIOS image required by this console.";
+        const char* empty_bios_label =
+            offers_bundled ? "OpenBIOS" : "(none selected)";
+        const char* bios_picker =
+            (plat == SETUP_PLAT_GBA) ? "Select GBA BIOS (gba_bios.bin)"
+            : (plat == SETUP_PLAT_PSX) ? "Select PlayStation BIOS (SCPH1001.BIN)"
+                                      : "Select BIOS file";
+
+        ImGui::TextUnformatted(bios_section);
+        ImGui::PushTextWrapPos(wrap_x);
+        ImGui::TextColored(col(th.text_muted), "%s", bios_help);
+        ImGui::PopTextWrapPos();
+        const char* bp = has_pick ? m->s.bios_path : empty_bios_label;
+        char belided[220];
+        elide_left(bp, px(300), belided, sizeof(belided));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(col(m->setup_bios_ok ? th.good : th.warn), "%s",
+                           m->setup_bios_ok ? "OK" : "Needed");
+        ImGui::SameLine();
+        ImGui::TextColored(col(has_pick ? th.text : th.text_muted), "%s", belided);
+        ImGui::SameLine();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(12), px(6)));
+        if (ImGui::Button("Browse BIOS##setup", ImVec2(px(120), px(32)))) {
+            request_bios_picker(m, bios_picker, true);
+        }
+        if (offers_bundled) {
+            ImGui::SameLine();
+            /* Always visible; greyed out when OpenBIOS is already selected. */
+            if (!has_pick) ImGui::BeginDisabled();
+            if (ImGui::Button("Use OpenBIOS##setup", ImVec2(px(128), px(32))))
+                launcher_model_request_bios_path(m, "");
+            if (!has_pick) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(has_pick
+                                      ? "Switch to bundled OpenBIOS (no rebuild)."
+                                      : "OpenBIOS is already selected.");
+        }
+        ImGui::PopStyleVar();
+        if (m->setup_bios_detail[0]) {
+            ImGui::PushTextWrapPos(wrap_x);
+            ImGui::TextColored(col(m->setup_bios_warn ? th.warn : th.text_muted),
+                               "%s", m->setup_bios_detail);
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::Dummy(ImVec2(0, px(12)));
+    }
+
+    ImGui::Text("%s. %s image", m->has_bios ? "2" : "1", noun);
+    ImGui::PushTextWrapPos(wrap_x);
+    if (plat == SETUP_PLAT_PSX) {
+        /* Keep the note as one wrapped TextColored block — SameLine +
+         * TextLinkOpenURL after a wrapped line leaves a huge empty gap in
+         * BeginPopupModal (Windows first-run wizard regression). */
+        ImGui::TextColored(col(th.text_muted),
+            "NOTE: psxrecomp games require a .cue + .bin dump of the disc. "
+            "Note the number of tracks required by this project; multitrack "
+            "discs are often Redump-formatted dumps. You can generate your own "
+            "from the original disc with redumper "
+            "(https://github.com/superg/redumper). You cannot convert a "
+            "single-track .bin or .iso to multitrack.");
+        ImGui::PopTextWrapPos();
+        setup_url_link("Open redumper", "https://github.com/superg/redumper");
+        ImGui::PushTextWrapPos(wrap_x);
+    } else {
+        const char* media_help =
+            (plat == SETUP_PLAT_GBA)
+                ? "Select your verified Game Boy Advance ROM (.gba)."
+            : (plat == SETUP_PLAT_SNES)
+                ? "Select your Super Nintendo ROM (.sfc / .smc)."
+                : "Select your game ROM file.";
+        ImGui::TextColored(col(th.text_muted), "%s", media_help);
+    }
+    ImGui::PopTextWrapPos();
+    {
+        const char* rp = m->rom_present ? m->rom_full : "(none selected)";
+        char relided[220];
+        elide_left(rp, px(360), relided, sizeof(relided));
+        const bool rom_ok = m->rom_present && strcmp(m->rom_size, "--") != 0 &&
+                            !(m->profile && m->profile->verify.mode == 1 &&
+                              (m->verify.verdict == 0 || m->verify.verdict == 3));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(col(rom_ok ? th.good : th.warn), "%s",
+                           rom_ok ? "OK" : "Needed");
+        ImGui::SameLine();
+        ImGui::TextColored(col(th.text), "%s", relided);
+        ImGui::SameLine();
+        char browse_lbl[48];
+        std::snprintf(browse_lbl, sizeof(browse_lbl), "Browse %s##setup", noun);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(12), px(6)));
+        if (ImGui::Button(browse_lbl, ImVec2(px(128), px(32)))) {
+            const SystemProfile* prof = (const SystemProfile*)m->profile;
+            char title[96];
+            if (plat == SETUP_PLAT_PSX)
+                std::snprintf(title, sizeof(title),
+                              "Select %s (.cue)", noun);
+            else
+                std::snprintf(title, sizeof(title), "Select %s", noun);
+            if (prof && prof->rom_filter.pattern_count > 0)
+                request_rom_picker(m, title, prof->rom_filter.patterns,
+                                   prof->rom_filter.pattern_count,
+                                   prof->rom_filter.desc, true);
+            else
+                request_rom_picker(m, title, NULL, 0, NULL, true);
+        }
+        ImGui::PopStyleVar();
+        if (m->profile && m->profile->verify.mode == 1)
+            draw_verdict_block(m, th, ImGui::GetContentRegionAvail().x);
+        if (plat == SETUP_PLAT_PSX && m->rom_present && m->rom_full[0]) {
+            const char* ext = strrchr(m->rom_full, '.');
+            if (ext && (lps_streq_ci(ext, ".bin") || lps_streq_ci(ext, ".img") ||
+                        lps_streq_ci(ext, ".car"))) {
+                ImGui::PushTextWrapPos(wrap_x);
+                ImGui::TextColored(col(th.warn),
+                    "You picked a track image (%s). Prefer the matching .cue "
+                    "in the same folder so multitrack discs are handled "
+                    "correctly.",
+                    ext);
+                ImGui::PopTextWrapPos();
+            }
+        }
+    }
+
+    /* Full first-run only: Generate & rebuild. Media-confirm (cleared disc/
+     * BIOS with sources already present) skips this — regenerate stays in
+     * Settings → SYSTEM when the host exposes it. */
+    if (!media_confirm &&
+        (m->prepare_disc_cb || m->prepare_with_progress_cb)) {
+        ImGui::Dummy(ImVec2(0, px(12)));
+        char section_buf[128];
+        const char* section;
+        if (m->prepare_section_title && m->prepare_section_title[0]) {
+            std::snprintf(section_buf, sizeof(section_buf), "%s. %s",
+                          m->has_bios ? "3" : "2", m->prepare_section_title);
+            section = section_buf;
+        } else if (plat == SETUP_PLAT_PSX) {
+            section = m->has_bios ? "3. Generate from disc"
+                                  : "2. Generate from disc";
+        } else {
+            section = m->has_bios ? "3. Convert raw dump (optional)"
+                                  : "2. Convert raw dump (optional)";
+        }
+        ImGui::TextUnformatted(section);
+        ImGui::PushTextWrapPos(wrap_x);
+        const char* prep_note =
+            (m->prepare_disc_note && m->prepare_disc_note[0])
+                ? m->prepare_disc_note
+                : (plat == SETUP_PLAT_PSX
+                       ? "Uses the selected .cue + track .bin files with the "
+                         "local SDK, then "
+                         "verifies digests against the game identity. Always "
+                         "point Generate at the .cue when both files exist."
+                       : "If your disc image is a raw dump that this game "
+                         "cannot boot directly, convert it here. Output is "
+                         "written next to the game.");
+        ImGui::TextColored(col(th.text_muted), "%s", prep_note);
+        ImGui::PopTextWrapPos();
+        const char* prep_lbl = (m->prepare_disc_label && m->prepare_disc_label[0])
+                                   ? m->prepare_disc_label
+                                   : ((m->rebuild_after_prepare &&
+                                       m->rebuild_with_progress_cb)
+                                          ? "Generate & rebuild…"
+                                          : (plat == SETUP_PLAT_PSX
+                                                 ? "Prepare disc…"
+                                                 : "Convert raw dump…"));
+        const bool use_selected = m->prepare_use_selected_rom;
+        const bool can_prep_selected = use_selected && m->rom_present &&
+                                       m->rom_full[0] &&
+                                       strcmp(m->rom_size, "--") != 0;
+        if (use_selected && !can_prep_selected) ImGui::BeginDisabled();
+        if (ImGui::Button(prep_lbl, ImVec2(px(240), px(32)))) {
+            if (use_selected) {
+                if (can_prep_selected)
+                    launcher_model_start_prepare_disc(m, m->rom_full);
+            } else {
+                char buf[512];
+                static const char* kPsxCueOnly[] = { "*.cue" };
+                static const char* kDumpPatterns[] = {
+                    "*.cue", "*.iso", "*.bin", "*.img", "*.car", "*.chd", "*.*" };
+                const char* const* pats =
+                    (plat == SETUP_PLAT_PSX) ? kPsxCueOnly : kDumpPatterns;
+                const int npat = (plat == SETUP_PLAT_PSX) ? 1 : 7;
+                if (launcher_pick_file(
+                        plat == SETUP_PLAT_PSX
+                            ? "Select disc (.cue)"
+                            : "Select raw disc dump to convert",
+                        pats, npat,
+                        plat == SETUP_PLAT_PSX ? "PlayStation disc (.cue)"
+                                               : "Disc dump",
+                        buf, sizeof(buf)))
+                    launcher_model_start_prepare_disc(m, buf);
+            }
+        }
+        if (use_selected && !can_prep_selected) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Select a verified %s first", noun);
+        }
+        if (m->setup_preparing) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            draw_setup_progress_modal(m, th);
+            return;
+        }
+    }
+
+    if (m->setup_status[0]) {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        ImGui::PushTextWrapPos(wrap_x);
+        ImGui::TextColored(col(th.good), "%s", m->setup_status);
+        ImGui::PopTextWrapPos();
+    }
+    if (m->setup_error[0]) {
+        ImGui::Dummy(ImVec2(0, px(6)));
+        ImGui::PushTextWrapPos(wrap_x);
+        ImGui::TextColored(col(th.warn), "%s", m->setup_error);
+        ImGui::PopTextWrapPos();
+    }
+
+    ImGui::Dummy(ImVec2(0, px(14)));
+    if (m->setup_needs_toolchain) {
+        if (ImGui::Button("Back", ImVec2(px(100), px(34)))) {
+            m->setup_page = 0;
+            /* Re-offer the update UI if a newer pack is still available. */
+            m->setup_tc_update_skipped = false;
+            m->setup_error[0] = '\0';
+            m->setup_status[0] = '\0';
+        }
+        ImGui::SameLine();
+    }
+    if (!m->prepare_required_before_continue) {
+        const bool ready = launcher_model_can_finish_setup(m);
+        const char* continue_lbl =
+            media_confirm
+                ? (m->has_bios ? "Confirm BIOS and disc" : "Confirm disc")
+                : "Continue to launcher";
+        if (!ready) ImGui::BeginDisabled();
+        if (ImGui::Button(continue_lbl, ImVec2(px(220), px(34)))) {
+            launcher_model_finish_setup(m);
+            ImGui::CloseCurrentPopup();
+        }
+        if (!ready) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (!m->rom_present || !m->rom_full[0])
+                    ImGui::SetTooltip("Select a %s first", noun);
+                else if (m->setup_preparing)
+                    ImGui::SetTooltip("Wait for the current job to finish");
+                else if (m->has_bios && !m->setup_bios_ok)
+                    ImGui::SetTooltip("BIOS check required");
+                else if (m->netplay_supported &&
+                         m->profile && m->profile->verify.mode == 1 &&
+                         !m->verify.netplay_ok)
+                    ImGui::SetTooltip("Disc mount / track layout not accepted");
+            }
+        }
+        ImGui::SameLine();
+    } else if (launcher_model_can_finish_setup(m) &&
+               m->action != LNG_ACTION_RELAUNCH) {
+        launcher_model_finish_setup(m);
+        ImGui::CloseCurrentPopup();
+    }
+    if (ImGui::Button("Quit", ImVec2(px(100), px(34))))
+        m->action = LNG_ACTION_QUIT;
+
+    if (m->setup_wizard_open && !ImGui::IsPopupOpen("First-run setup"))
+        ImGui::OpenPopup("First-run setup");
+    ImGui::EndPopup();
+}
+
+
+static const char* generate_disabled_reason(const LauncherModel* m) {
+    if (!m) return "Generate is unavailable.";
+    const bool has_prep =
+        m->prepare_with_progress_cb != nullptr || m->prepare_disc_cb != nullptr;
+    if (!has_prep) {
+        return "Generate is unavailable (project/SDK not found).\n"
+               "Launch from RetComM, or run the game from its source tree "
+               "(src/current).";
+    }
+    if (!m->rom_present || !m->rom_full[0])
+        return "Select a disc image first";
+    return "Generate is unavailable.";
+}
+
+void draw_bios_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
+    if (m->bios_confirm_open) ImGui::OpenPopup("Switch BIOS?");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Switch BIOS?", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + px(420));
+    ImGui::TextWrapped(
+        "This retail BIOS is not compiled into the current build yet. "
+        "Generate & rebuild will emit its BIOS C and rebuild the game binary "
+        "with your current disc and toolchain. OpenBIOS switches never need "
+        "this — use Use OpenBIOS instead.");
+    if (m->bios_pending_path[0]) {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        ImGui::TextColored(col(th.text_muted), "Selected:");
+        ImGui::TextWrapped("%s", m->bios_pending_path);
+    } else {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        ImGui::TextColored(col(th.text_muted), "Selected: OpenBIOS");
+    }
+    if (m->setup_bios_detail[0]) {
+        ImGui::Dummy(ImVec2(0, px(6)));
+        ImGui::TextColored(col(th.warn), "%s", m->setup_bios_detail);
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, px(12)));
+    const bool can_gen = m->rom_present && m->rom_full[0] &&
+                         (m->prepare_with_progress_cb || m->prepare_disc_cb);
+    if (!can_gen) ImGui::BeginDisabled();
+    if (ImGui::Button("Generate & rebuild…", ImVec2(px(200), px(32))))
+        launcher_model_bios_confirm_accept(m);
+    if (!can_gen) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", generate_disabled_reason(m));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Use OpenBIOS", ImVec2(px(130), px(32)))) {
+        launcher_model_bios_confirm_cancel(m);
+        launcher_model_request_bios_path(m, "");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(px(100), px(32))))
+        launcher_model_bios_confirm_cancel(m);
+    if (!m->bios_confirm_open) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void draw_bios_play_modal(LauncherModel* m, const LauncherTheme& th) {
+    if (m->bios_play_modal_open) ImGui::OpenPopup("BIOS not ready to Play");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("BIOS not ready to Play", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + px(440));
+    ImGui::TextWrapped(
+        "The selected retail BIOS is not compiled into this build. Generate & "
+        "rebuild with it (same disc and toolchain), switch to OpenBIOS to Play "
+        "without rebuilding, or cancel and keep the current selection.");
+    if (m->s.bios_path[0]) {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        ImGui::TextColored(col(th.text_muted), "Current selection:");
+        ImGui::TextWrapped("%s", m->s.bios_path);
+    } else {
+        ImGui::Dummy(ImVec2(0, px(8)));
+        ImGui::TextColored(col(th.text_muted), "Current selection: OpenBIOS");
+    }
+    if (m->setup_bios_detail[0]) {
+        ImGui::Dummy(ImVec2(0, px(6)));
+        ImGui::TextColored(col(th.warn), "%s", m->setup_bios_detail);
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, px(12)));
+    const bool can_gen = m->rom_present && m->rom_full[0] &&
+                         (m->prepare_with_progress_cb || m->prepare_disc_cb);
+    if (!can_gen) ImGui::BeginDisabled();
+    if (ImGui::Button("Generate & rebuild…", ImVec2(px(200), px(32))))
+        launcher_model_bios_play_generate(m);
+    if (!can_gen) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", generate_disabled_reason(m));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Use OpenBIOS", ImVec2(px(130), px(32))))
+        launcher_model_bios_play_use_openbios(m);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(px(100), px(32))))
+        launcher_model_bios_play_cancel(m);
+    if (!m->bios_play_modal_open) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void draw_pgo_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
+    if (m->pgo_confirm_open) ImGui::OpenPopup("Optimize FMV Playback?");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Optimize FMV Playback?", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + px(460));
+    ImGui::TextWrapped(
+        "This will rebuild an instrumented binary, run the intro FMV in PGO "
+        "training mode (video window open — do not close or interact with it), "
+        "then rebuild the game with those profiles. Existing generated C is "
+        "reused; the setup wizard is not run.");
+    ImGui::Dummy(ImVec2(0, px(8)));
+    ImGui::TextColored(col(th.warn),
+                       "Expect several minutes. Keep this launcher open until "
+                       "training finishes, then the optimized binary relaunches.");
+    ImGui::Dummy(ImVec2(0, px(6)));
+    ImGui::TextColored(col(th.text_muted),
+                       "Each peer may run this independently for rollback "
+                       "netplay. Digests must still match.");
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, px(12)));
+    if (ImGui::Button("Start training", ImVec2(px(160), px(32))))
+        launcher_model_pgo_confirm_accept(m);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(px(100), px(32))))
+        launcher_model_pgo_confirm_cancel(m);
+    if (!m->pgo_confirm_open) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void draw_fmv_timing_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
+    if (m->fmv_timing_confirm_open)
+        ImGui::OpenPopup("Apply FMV Timing Opt?");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Apply FMV Timing Opt?", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + px(460));
+    ImGui::TextWrapped(
+        "This regenerates game C from game.toml (including "
+        "load_charge_batch for VLC leaves), then rebuilds. It does not "
+        "disable load-delay and does not run PGO training.");
+    ImGui::Dummy(ImVec2(0, px(8)));
+    ImGui::TextColored(col(th.warn),
+                       "Expect a few minutes for generate + rebuild. The "
+                       "launcher will relaunch the new binary when done.");
+    ImGui::Dummy(ImVec2(0, px(6)));
+    ImGui::TextColored(col(th.text_muted),
+                       "Both peers need the same load_charge_batch setting "
+                       "for matching rollback digests.");
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, px(12)));
+    if (ImGui::Button("Generate & rebuild", ImVec2(px(180), px(32))))
+        launcher_model_fmv_timing_confirm_accept(m);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(px(100), px(32))))
+        launcher_model_fmv_timing_confirm_cancel(m);
+    if (!m->fmv_timing_confirm_open) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
 }
 
 void draw_skip_modal(LauncherModel* m) {
@@ -3529,6 +7856,29 @@ void draw_skip_modal(LauncherModel* m) {
         ImGui::SameLine();
         if (ImGui::Button("Skip on Boot", ImVec2(px(140), 0))) {
             launcher_model_skip_confirm(m); ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void draw_restore_defaults_modal(LauncherModel* m) {
+    if (m->defaults_modal_open) ImGui::OpenPopup("Restore default settings?");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Restore default settings?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "This resets display, audio, controller, and launcher choices. "
+            "Your selected ROM, SRAM, and save states are not changed.");
+        ImGui::Spacing();
+        if (ImGui::Button("Cancel", ImVec2(px(120), 0))) {
+            launcher_model_cancel_restore_defaults(m);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Restore Defaults", ImVec2(px(150), 0))) {
+            launcher_model_restore_defaults(m);
+            ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
     }
@@ -3600,26 +7950,57 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
             ImGui::PopStyleColor();
         }
     ImGui::EndGroup();
-    {   // right-aligned netplay name + nav buttons
-        const char* label = (m->view == LNG_VIEW_DASHBOARD) ? "Settings" : "< Back";
-        const float w = px(110.0f);
-        const float name_w = px(170.0f);
-        float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
-        float nav_y = hdr_top + px(6.0f);
-        if (m->view == LNG_VIEW_NETPLAY && m->netplay_supported) {
-            ImGui::SetCursorPos(ImVec2(right - w - name_w - px(10.0f), nav_y));
-            const char* player_label = m->s.netplay_player_name[0] ? m->s.netplay_player_name : "Set player name";
-            if (ImGui::Button(player_label, ImVec2(name_w, px(34)))) {
-                std::snprintf(m->netplay_name_edit, sizeof(m->netplay_name_edit), "%s",
-                              m->s.netplay_player_name);
-                m->netplay_name_modal_open = true;
+    {   // right-aligned top-level navigation
+        const float gap = px(6.0f);
+        const float resume_x = ImGui::GetCursorPosX();
+        const float resume_y = ImGui::GetCursorPosY();
+        const float right = ImGui::GetWindowContentRegionMax().x;
+        const float y = hdr_top + px(6.0f);
+        if (m->view == LNG_VIEW_DASHBOARD) {
+            const int count = 1 + (m->mods ? 1 : 0) +
+                              (m->has_assist_tools ? 1 : 0) +
+                              ((m->credits_text && m->credits_text[0]) ? 1 : 0);
+            const float w = px(110.0f);
+            const float total = w * count + gap * (count - 1);
+            ImGui::SetCursorPos(ImVec2(right - total, y));
+            if (ImGui::Button("Settings", ImVec2(w, px(34))))
+                launcher_model_set_view(m, LNG_VIEW_SETTINGS);
+            if (m->mods) {
+                ImGui::SameLine(0, gap);
+                if (ImGui::Button("Mods", ImVec2(w, px(34))))
+                    launcher_model_set_view(m, LNG_VIEW_MODS);
             }
+            if (m->has_assist_tools) {
+                ImGui::SameLine(0, gap);
+                if (ImGui::Button("Assist Tools", ImVec2(w, px(34))))
+                    launcher_model_set_view(m, LNG_VIEW_ASSIST_TOOLS);
+            }
+            if (m->credits_text && m->credits_text[0]) {
+                ImGui::SameLine(0, gap);
+                if (ImGui::Button("Credits", ImVec2(w, px(34))))
+                    launcher_model_set_view(m, LNG_VIEW_CREDITS);
+            }
+        } else {
+            const float w = px(110.0f);
+            const float name_w = px(170.0f);
+            if (m->view == LNG_VIEW_NETPLAY && m->netplay_supported) {
+                ImGui::SetCursorPos(ImVec2(right - w - name_w - gap, y));
+                const char* player_label = m->s.netplay_player_name[0]
+                    ? m->s.netplay_player_name : "Set player name";
+                if (ImGui::Button(player_label, ImVec2(name_w, px(34)))) {
+                    std::snprintf(m->netplay_name_edit,
+                                  sizeof(m->netplay_name_edit), "%s",
+                                  m->s.netplay_player_name);
+                    m->netplay_name_modal_open = true;
+                }
+            }
+            ImGui::SetCursorPos(ImVec2(right - w, y));
+            if (ImGui::Button("< Back", ImVec2(w, px(34))))
+                launcher_model_set_view(m, LNG_VIEW_DASHBOARD);
         }
-        ImGui::SetCursorPos(ImVec2(right - w, nav_y));
-        if (ImGui::Button(label, ImVec2(w, px(34)))) {
-            launcher_model_set_view(m, m->view == LNG_VIEW_DASHBOARD
-                                        ? LNG_VIEW_SETTINGS : LNG_VIEW_DASHBOARD);
-        }
+        // Absolute placement prevents three dashboard buttons from mutating
+        // the title group's line state and wrapping Settings into the body.
+        ImGui::SetCursorPos(ImVec2(resume_x, resume_y));
     }
     // marquee underline: neon gradient rule under the header
     ImGui::Dummy(ImVec2(0, px(8.0f)));
@@ -3646,10 +8027,19 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
         case LNG_VIEW_SETTINGS:   draw_settings(m, th);             break;
         case LNG_VIEW_CONTROLLER: draw_controller(m, th);           break;
         case LNG_VIEW_NETPLAY:    draw_netplay(m, th);              break;
+        case LNG_VIEW_MODS:       draw_mods(m, th);                 break;
+        case LNG_VIEW_ASSIST_TOOLS: draw_assist_tools(m, th);        break;
+        case LNG_VIEW_CREDITS:      draw_credits(m, th);             break;
     }
     end_container();
 
     draw_footer(m, th, footer_h);
+    draw_setup_wizard_modal(m, th);
+    draw_bios_confirm_modal(m, th);
+    draw_bios_play_modal(m, th);
+    draw_pgo_confirm_modal(m, th);
+    draw_fmv_timing_confirm_modal(m, th);
+    draw_standalone_builtin_rom_picker(m, th);
     draw_skip_modal(m);
     draw_netplay_player_modal(m);
     draw_netplay_network_modal(m, th);
@@ -3657,6 +8047,7 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
     draw_netplay_password_modal(m, th);
     draw_netplay_direct_modal(m, th);
     draw_netplay_room_modal(m, th);
+    draw_restore_defaults_modal(m);
     // Transfer Pak config modal (N64): opened by any tile, dashboard or
     // Controller page. Drawn at root so it isn't clipped by a card child.
     if (m->tpak_slots > 0) draw_tpak_modal(m, th);
@@ -3695,33 +8086,135 @@ static bool raw_input_is_mapped(SDL_JoystickID which, bool is_axis, int raw_inde
 #endif
 
 bool try_capture(LauncherModel* m, const SDL_Event& ev) {
-    if (!m->capturing && !m->hk_capturing) return false;
+    if (!m->capturing && !m->hk_capturing &&
+        !m->camera_capturing)
+        return false;
 
     // ESC cancels any capture — keyboard, pad, or hotkey.
     if (ev.type == SDL_EVENT_KEY_DOWN && LNG_EVKEY(ev) == SDLK_ESCAPE) {
         launcher_model_cancel_capture(m);
         launcher_model_cancel_hk_capture(m);
+        launcher_model_cancel_camera_capture(m);
         return true;
     }
 
-    // ---- GAMEPAD bind capture (capture_pad set; Genesis only) --------------
-    // GAMEPAD binds (has_pad_binds consoles) persist a button/axis through the
-    // console's native bridge. Swallow everything while listening; a controller
-    // button press or a decisive axis push (past a dead threshold) commits.
+    if (m->camera_capturing) {
+        if (ev.type != SDL_EVENT_KEY_DOWN) return true;
+        launcher_binds_set_camera(
+            m, m->capture_camera, (int)LNG_EVSCAN(ev));
+        launcher_model_cancel_camera_capture(m);
+        return true;
+    }
+
+    // ---- GAMEPAD bind capture (capture_pad: Genesis + PSX Gamepad Bindings)
+    // Persist a button/axis through the console's native bridge. Swallow
+    // everything while listening; a controller button press or a decisive
+    // axis push (past a dead threshold) commits. PSX only accepts events from
+    // the player's selected Input source device.
     if (m->capturing && m->capture_pad) {
-        if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        if (m->settings_bindings && m->capture_assist) {
+            if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+                const int button = (int)LNG_EVGBTN(ev);
+                uint32_t mask = launcher_input_gamepad_button_mask(
+                    (uint32_t)LNG_EVGBTNWHICH(ev));
+                if (button >= 0 && button < 32)
+                    mask |= (uint32_t)1u << button;
+                if (button_mask_count(mask) >= 2) {
+                    launcher_model_set_captured_pad(
+                        m, RECOMP_LAUNCHER_PAD_BUTTON_COMBO((int)mask));
+                    launcher_model_cancel_capture(m);
+                    return true;
+                }
+                if (settings_pad_button_is_select(button))
+                    return true;
+                launcher_model_set_captured_pad(
+                    m, RECOMP_LAUNCHER_PAD_BUTTON(button));
+                launcher_model_cancel_capture(m);
+                return true;
+            }
+            if (ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+                const int val = (int)LNG_EVGAXISVAL(ev);
+                if (val >= 20000 || val <= -20000) {
+                    launcher_model_set_captured_pad(
+                        m, RECOMP_LAUNCHER_PAD_AXIS(
+                               (int)LNG_EVGAXIS(ev), val > 0));
+                    launcher_model_cancel_capture(m);
+                }
+                return true;
+            }
+            return true;
+        }
+        const SystemProfile* cap_prof = (const SystemProfile*)m->profile;
+        const bool psx_cap = cap_prof && cap_prof->id && !strcmp(cap_prof->id, "psx");
+        const uint32_t want_id = m->player_pad_id[m->cfg_player];
+        auto from_selected = [&](uint32_t which) -> bool {
+            if (!psx_cap) return true;                 // Genesis: any pad
+            if (!want_id) return false;
+            return which == want_id;
+        };
+        auto try_clear_release_wait = [&](uint32_t which) {
+            if (!m->map_all_wait_release) return;
+            if (!from_selected(which)) return;
+            // Require the whole pad at rest — clearing on a single idle axis
+            // let a held stick re-commit on every subsequent AXIS_MOTION.
+            if (launcher_input_gamepad_at_rest(which))
+                m->map_all_wait_release = false;
+        };
+        auto commit_pad = [&](int kind, int code, int axis_dir) {
             launcher_binds_set_pad_button(m, m->cfg_player + 1, m->capture_btn,
-                                          LNG_PADBIND_BUTTON, (int)LNG_EVGBTN(ev), 0);
-            launcher_model_cancel_capture(m);
+                                          kind, code, axis_dir);
+            if (m->map_all_active)
+                launcher_model_map_all_advance(m);
+            else
+                launcher_model_cancel_capture(m);
+        };
+        if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+            if (m->map_all_wait_release) {
+                try_clear_release_wait((uint32_t)LNG_EVGBTNWHICH(ev));
+                return true;  // never bind while waiting for release
+            }
+            if (from_selected((uint32_t)LNG_EVGBTNWHICH(ev)))
+                commit_pad(LNG_PADBIND_BUTTON, (int)LNG_EVGBTN(ev), 0);
+            return true;
+        }
+        if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+            try_clear_release_wait((uint32_t)LNG_EVGBTNWHICH(ev));
             return true;
         }
         if (ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-            int val = (int)LNG_EVGAXISVAL(ev);
-            if (val >= 20000 || val <= -20000) {   // ignore rest/jitter near center
-                launcher_binds_set_pad_button(m, m->cfg_player + 1, m->capture_btn,
-                                              LNG_PADBIND_AXIS, (int)LNG_EVGAXIS(ev),
-                                              val < 0 ? -1 : +1);
-                launcher_model_cancel_capture(m);
+            if (from_selected((uint32_t)LNG_EVGAXISWHICH(ev))) {
+                if (m->map_all_wait_release) {
+                    try_clear_release_wait((uint32_t)LNG_EVGAXISWHICH(ev));
+                    return true;
+                }
+                const int val = (int)LNG_EVGAXISVAL(ev);
+                if (val < 20000 && val > -20000) return true; // rest/jitter
+                const int axis = (int)LNG_EVGAXIS(ev);
+                // PSX: every pad slot is a digital bit. Stick axes belong on
+                // L-Stick/R-Stick direction rows (indices 16..23); ignore them
+                // on face/shoulder slots so a twitchy stick cannot steal
+                // L1/Cross/etc. Trigger axes (L2/R2) are always OK — the
+                // runtime thresholds them to digital. Buttons still win when
+                // SDL emits GAMEPAD_BUTTON_DOWN for the same physical control.
+                if (psx_cap) {
+                    const int slot = m->capture_btn;
+                    const bool stick_dir_slot = (slot >= 16 && slot < 24);
+#if defined(LNG_SDL3)
+                    const bool stick_axis =
+                        axis == (int)SDL_GAMEPAD_AXIS_LEFTX ||
+                        axis == (int)SDL_GAMEPAD_AXIS_LEFTY ||
+                        axis == (int)SDL_GAMEPAD_AXIS_RIGHTX ||
+                        axis == (int)SDL_GAMEPAD_AXIS_RIGHTY;
+#else
+                    const bool stick_axis =
+                        axis == (int)SDL_CONTROLLER_AXIS_LEFTX ||
+                        axis == (int)SDL_CONTROLLER_AXIS_LEFTY ||
+                        axis == (int)SDL_CONTROLLER_AXIS_RIGHTX ||
+                        axis == (int)SDL_CONTROLLER_AXIS_RIGHTY;
+#endif
+                    if (!stick_dir_slot && stick_axis) return true;
+                }
+                commit_pad(LNG_PADBIND_AXIS, axis, val < 0 ? -1 : +1);
             }
             return true;
         }
@@ -3767,6 +8260,24 @@ bool try_capture(LauncherModel* m, const SDL_Event& ev) {
         return true;   // swallow all other input (keyboard included) while pad-capturing
     }
 
+    /* Mouse buttons are bindable inputs on stores that keep alternates
+     * (PSX): bind-a-mouse-button is the whole point of the alt slot. ImGui
+     * opens capture on release, so the next down event is deliberate. */
+    if (m->capturing && !m->capture_pad) {
+        const SystemProfile* mprof = (const SystemProfile*)m->profile;
+        const bool alt_store = mprof && mprof->controller.binds_per_input >= 2;
+        if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP) return true;   /* swallow */
+        if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            if (!alt_store || !m->capture_mouse_armed) return true;
+            int btn = (int)ev.button.button;      /* SDL: 1 L, 2 M, 3 R, 4/5 side */
+            if (btn >= 1 && btn <= 5) {
+                launcher_binds_set_button_slot(m, m->cfg_player + 1, m->capture_btn,
+                                               m->capture_slot, 512 + btn);
+                launcher_model_cancel_capture(m);
+            }
+            return true;
+        }
+    }
     if (ev.type != SDL_EVENT_KEY_DOWN) return true;   // swallow non-key input while capturing
     if (m->capturing) {
         // N64's input.cfg keeps two alternate binds per input, so a keyboard
@@ -3774,7 +8285,12 @@ bool try_capture(LauncherModel* m, const SDL_Event& ev) {
         // Single-bind stores (SNES/PSX/GBA) use the legacy scancode setter
         // (capture_slot is always 0 for them).
         const SystemProfile* prof = (const SystemProfile*)m->profile;
-        if (prof && prof->controller.binds_per_input >= 2)
+        if (m->settings_bindings && m->capture_assist)
+            launcher_model_set_captured_key(m, (int)LNG_EVSCAN(ev));
+        else if (prof && prof->controller.binds_per_input >= 2 && prof->id && !strcmp(prof->id, "psx"))
+            launcher_binds_set_button_slot(m, m->cfg_player + 1, m->capture_btn,
+                                           m->capture_slot, (int)LNG_EVSCAN(ev));
+        else if (prof && prof->controller.binds_per_input >= 2)
             launcher_binds_set_field(m, m->cfg_player + 1, m->capture_btn, m->capture_slot,
                                      RUI_N64_FIELD_KEY, (int)LNG_EVSCAN(ev));
         else
@@ -3809,7 +8325,11 @@ std::string asset(const char* rel) {
     std::string path = normalized_path(rel);
     if (is_absolute_path(path)) return path;
 
+#if defined(__ANDROID__)
+    const char* base = SDL_AndroidGetInternalStoragePath();
+#else
     const char* base = SDL_GetBasePath();
+#endif
     std::string out = normalized_path(base ? base : "");
     if (!out.empty() && !path.empty() && out.back() != '/')
         out.push_back('/');
@@ -3841,11 +8361,15 @@ extern "C" bool launcher_panel_available(const LauncherPanel* p, const LauncherM
 extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
                                           LauncherModel* m,
                                           const LauncherTheme* th) {
+    launcher_boot_timing_mark("rui:backend_run:begin");
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+#if defined(__ANDROID__)
+    io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
+#endif
     io.IniFilename = nullptr;
     // Test hook: force the focus ring always-on so scripted screenshots can
     // verify nav rendering without a physical pad. Off => normal auto behaviour
@@ -3874,6 +8398,7 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
 #else
     ImGui_ImplOpenGL3_Init("#version 330");
 #endif
+    launcher_boot_timing_mark("rui:imgui_gl_ready");
 
     // Box art: per-game path from the ABI when given (multi-variant repos
     // stage one file per variant in a shared build dir), else the default.
@@ -3947,6 +8472,7 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
     // memcard.tga is already 32-bit with real alpha (no colorkey backdrop),
     // same as pad_analog.tga/pad_digital.tga above.
     g_memcard = launcher_texture_load(asset("assets/img/memcard.tga").c_str());
+    launcher_boot_timing_mark("rui:textures_loaded");
 
     std::string font_path = asset("assets/fonts/LatoLatin-Regular.ttf");
     // Optional Japanese subset, merged over the Latin base when present (PMS-J).
@@ -3970,6 +8496,7 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
     // Unset => stock ImGui behavior (the SDL/GL backend's own framebuffer scale).
     const char* force_scale_env = SDL_getenv("LNG_FORCE_SCALE");
     const bool force_dpi = force_scale_env && force_scale_env[0] && SDL_atof(force_scale_env) > 1.0;
+    bool first_present_marked = false;
 
     while (m->action == LNG_ACTION_NONE && !p->should_quit) {
         if (smoke_frames > 0 && ++frame > smoke_frames) { m->action = LNG_ACTION_QUIT; break; }
@@ -3988,13 +8515,44 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
                         jp_font_path.c_str(), symbols_font_path.c_str(),
                         emoji_font_path.c_str());
             applied_scale = p->display_scale;
+            if (!first_present_marked)
+                launcher_boot_timing_mark("rui:fonts_built");
         }
 
         // Re-poll connected gamepads every frame so hot-plugged pads (e.g. a
         // DualSense powered on after launch) appear without a relaunch.
-        g_pad_count = launcher_input_poll(g_pads, LNG_MAX_PADS);
+        g_pad_count = launcher_input_poll(
+            g_pads, LNG_MAX_PADS, m->has_gyro_controls ? 1 : 0);
+
+        // PSX: keep Input source labels on concrete pad names (live SDL name
+        // or saved [gamepads] registry), never the generic "Gamepad" placeholder.
+        launcher_binds_sync_psx_pad_sources(m, g_pads, g_pad_count);
+
+        // Pad capture release-gate: clear once the selected pad is fully at
+        // rest (covers the case where SDL stops sending AXIS_MOTION at rest).
+        if (m->capturing && m->capture_pad && m->map_all_wait_release) {
+            const uint32_t id = m->player_pad_id[m->cfg_player];
+            if (id && launcher_input_gamepad_at_rest(id))
+                m->map_all_wait_release = false;
+        }
 
         ImGui_ImplOpenGL3_NewFrame();
+        /* Suspend ImGui's GAMEPAD navigation while a bind capture is open.
+         *
+         * The SDL backend POLLS gamepad state in NewFrame (see
+         * ImGui_ImplSDL3_UpdateGamepads) rather than reading the SDL event
+         * queue, so swallowing pad events in try_capture cannot stop the pad
+         * from driving the menu: press a button to bind it and the focus
+         * jumps instead. Clearing the flag for the frame is the only thing
+         * that actually suppresses it. Keyboard nav stays on so Esc, arrows
+         * and Enter still work while listening. */
+        {
+            ImGuiIO& nav_io = ImGui::GetIO();
+            if (m->capturing || m->hk_capturing || m->camera_capturing)
+                nav_io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+            else
+                nav_io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+        }
         LNG_ImplSDL_NewFrame();
         if (force_dpi) {   // Windows has no native point/pixel split — inject it
             ImGuiIO& io = ImGui::GetIO();
@@ -4012,8 +8570,13 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         launcher_debug_step(p, m);   // script/screenshot: after draw, before swap
         launcher_platform_present(p);
+        if (!first_present_marked) {
+            launcher_boot_timing_mark("rui:first_swap");
+            first_present_marked = true;
+        }
     }
 
+    launcher_input_shutdown();
     launcher_texture_free(&g_boxart);
     launcher_texture_free(&g_pad);
     launcher_texture_free(&g_pad_analog);
@@ -4031,5 +8594,9 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
     ImGui::DestroyContext();
 
     if (p->should_quit && m->action == LNG_ACTION_NONE) m->action = LNG_ACTION_QUIT;
+    // Persist selected gamepads (defaults if never remapped) so PLAY remembers
+    // the pad in input.ini / settings even without an explicit Save click.
+    if (m->action == LNG_ACTION_LAUNCH || m->action == LNG_ACTION_RELAUNCH)
+        launcher_binds_prepare_psx_launch(m, g_pads, g_pad_count);
     return m->action;
 }

@@ -7,7 +7,8 @@
 // Driven by the LNG_SCRIPT env var: a ';'-separated command list, executed one
 // command per frame.
 //
-//   view:dashboard|settings|controller   switch view (no clicking required)
+//   view:dashboard|settings|controller|assist_tools|credits
+//                                          switch view (no clicking required)
 //   player:0|1                           which player the controller view edits
 //   size:WxH                             resize the window (tests live reflow)
 //   click:X,Y                            synthetic click at logical coords

@@ -40,7 +40,7 @@ typedef struct { const char* label; int code; } ButtonDef;
 // text; `button_count` is how many LEADING entries of ControllerSpec.buttons[]
 // the rebind page shows in that mode (a Genesis 3-button pad has no X/Y/Z/Mode
 // rows). A profile that leaves ControllerSpec.modes NULL keeps the legacy
-// PSX-shaped selector (Hybrid/Analog/D-Pad, gated by allow_hybrid) with the
+// PSX-shaped selector (Analog/D-Pad) with the
 // full button set in every mode — PSX itself is untouched by this concept.
 typedef struct { int mode; const char* label; int button_count; } PadModeDef;
 
@@ -77,6 +77,7 @@ typedef struct {
         antialiasing, spu_hq, skip_fmv, turbo_loads, bios, deadzone; // PSX-ish deep surface
     // appended additively (older positional initializers zero-fill):
     int widescreen_cells;   // Genesis-ish: "extra cells per side" stepper shown while widescreen is on
+    int fmv_filter;         // PSX-ish: how a decoded low-res movie is scaled to the window
 } VideoSpec;
 
 // ---- Verify module --------------------------------------------------------------
@@ -90,10 +91,13 @@ typedef bool (*VerifyProbeFn)(const LauncherModel* m, VerifyResult* out);
 typedef struct { int mode; /* 0 rom-hash, 1 disc-verdict */ VerifyProbeFn probe; } VerifySpec;
 
 // ---- Hotkeys module: a bitmask over LngHotkey (launcher_model.h) --------------
-// LNG_HK_COUNT is 11 today; ALL bits set = every catalog hotkey opted in.
-// SNES uses this (full legacy catalog, byte-identical to the original single
-// hardcoded panel); PSX opts into a tailored subset instead — see its row.
+// The first 11 entries are the universal catalog. Capability-specific rows
+// (currently the three solar controls) are added by the panel at draw time, so
+// SNES and other non-solar systems keep their byte-identical legacy catalog.
 #define LNG_HOTKEYS_ALL 0x7FFu
+#define LNG_HOTKEYS_SOLAR ((uint32_t)((1u << LNG_HK_SOLAR_BRIGHTER) | \
+                                      (1u << LNG_HK_SOLAR_DIMMER) | \
+                                      (1u << LNG_HK_SOLAR_LIVE)))
 
 // ---- ROM file-picker filter --------------------------------------------------
 // The native "Change ROM" dialog's extension filter, per console — so a GBA

@@ -96,6 +96,24 @@ The System is the **template**; the Game **refines** it.
 | Saves not always; SRAM vs memcard | Save module, optional, `kind`-specialized |
 | 2 vs 4 pads; expose 1/2/4 | `SystemProfile.max_players` + `Game.exposed_players` |
 
+Hosts may optionally provide a complete `default_settings` snapshot through
+the C ABI. The launcher copies it during model initialization and then exposes
+a confirmed Restore Defaults action in the Settings footer. Confirmation
+replaces only the editable settings value; ROM selection and save files remain
+separately owned.
+
+Hosts may also add two top-level pages without forking the renderer.
+`has_assist_tools` exposes a host-defined opt-in backed by the additive
+`Settings.assist_tools` field and an optional explanatory note.
+`settings_bindings` is a separate opt-in for hosts whose runtime consumes the
+returned settings directly. It adds per-player keyboard/controller arrays and
+optional named Assist-action arrays. Keyboard entries are SDL scancodes;
+controller entries encode standard SDL gamepad buttons or signed axes. Hosts
+without this flag continue through their existing native bind bridges.
+`credits_text` exposes read-only, host-owned UTF-8 credits. Both capabilities
+default absent, preserving the original Dashboard/Settings/Controller view
+set for existing games.
+
 ## Concrete C shape (data-driven, no fake OOP)
 
 ```c
