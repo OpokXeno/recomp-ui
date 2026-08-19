@@ -82,9 +82,8 @@
 #endif
 
 extern "C" {
-void launcher_model_toggle_frame_interp(LauncherModel* m);
-void launcher_model_cycle_interp_fps(LauncherModel* m);
-const char* launcher_model_interp_fps_label(const LauncherModel* m);
+void launcher_model_cycle_fps(LauncherModel* m);
+const char* launcher_model_fps_label(const LauncherModel* m);
 }
 
 extern "C" const char* launcher_backend_name(void) { return "Dear ImGui"; }
@@ -2286,6 +2285,8 @@ bool any_deep_display(const LauncherModel* m) {
 // the fixed height (byte-identical to before this console existed).
 bool video_card_grows(const LauncherModel* m) {
     if (any_deep_display(m)) return true;
+    if (m->widescreen_supported || m->aspect_mask || m->num_aspect_labels > 0)
+        return true;
     if (m->has_shader) return true;
     if (m->has_sharp_filter || m->has_affine_filter) return true;
     if (m->num_display_layouts > 0) return true;
@@ -2293,6 +2294,26 @@ bool video_card_grows(const LauncherModel* m) {
     // add extra rows the fixed no_scroll band wasn't sized for.
     if (m->has_integer_scale || m->hdpack_supported) return true;
     return false;
+}
+
+static void draw_view_aspect_row(LauncherModel* m, const LauncherTheme& th,
+                                 float col_w = 0.0f) {
+    const bool has_aspects = m->aspect_mask ||
+                             (m->aspect_labels && m->num_aspect_labels > 0);
+    if (has_aspects) {
+        row_label("Aspect ratio", th, col_w);
+        if (ImGui::Button(launcher_model_aspect_label(m), ImVec2(px(180), px(30))))
+            launcher_model_cycle_aspect(m);
+        if (m->aspect_experimental) {
+            ImGui::SameLine(0, px(8));
+            ImGui::TextColored(col(th.warn), "EXPERIMENTAL");
+        }
+    } else if (m->widescreen_supported) {
+        row_label("Widescreen 16:9", th, col_w);
+        bool widescreen = m->s.widescreen != 0;
+        if (ImGui::Checkbox("##widescreen", &widescreen))
+            launcher_model_toggle_widescreen(m);
+    }
 }
 
 void draw_shader_row(LauncherModel* m, const LauncherTheme& th, float col_w = 0.0f) {
@@ -2401,6 +2422,7 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
                 launcher_model_cycle_display_layout(m);
             ImGui::PopID();
         }
+        draw_view_aspect_row(m, th, cw);
         if (m->has_integer_scale) {   // NES module: snap the image to integer multiples
             row_label("Integer scaling", th, cw);
             bool is = m->s.integer_scale != 0;
@@ -2450,9 +2472,9 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
     }
 
     // ---- deeper PSX-style surface, capability-gated per control -----------
-    // Order matches the original PSX launcher: Window size, Renderer,
+    // Order matches the original PSX launcher: Window size, FPS,
     // Supersampling, Aspect ratio, Texture filtering, Antialiasing, Screen
-    // model, Frame interpolation (+Presentation target), Skip FMVs, Turbo
+    // model, Skip FMVs, Turbo
     // loads, Fullscreen.
     if (m->has_window_size) {
         row_label("Window size", th);
@@ -2475,10 +2497,10 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
         if (ImGui::Checkbox("##intscale", &is)) launcher_model_toggle_integer_scale(m);
     }
 
-    if (m->has_renderer) {
-        row_label("Renderer", th);
-        if (ImGui::Button(launcher_model_renderer_label(m), ImVec2(px(220), px(30))))
-            launcher_model_toggle_renderer(m);
+    if (m->has_frame_interp) {
+        row_label("FPS", th);
+        if (ImGui::Button(launcher_model_fps_label(m), ImVec2(px(150), px(30))))
+            launcher_model_cycle_fps(m);
     }
 
     if (m->has_supersampling) {
@@ -2495,6 +2517,8 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
                 "CPU VRAM authority stays at 1x for snaps/digests.");
         }
     }
+
+    draw_view_aspect_row(m, th);
 
     // Universal fullscreen row (every console — no longer gated on the
     // vestigial has_fullscreen_toggle). Tri-state cycle replaces the old
@@ -2598,20 +2622,6 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
         // shorter models (e.g. "DMG") center within the same fixed box.
         if (ImGui::Button(launcher_model_screen_kind_label(m), ImVec2(px(220), px(30))))
             launcher_model_cycle_screen_kind(m);
-    }
-
-    // Frame interpolation is only meaningful under OpenGL (Software has no
-    // interpolation pass); Presentation target only matters once frame
-    // interpolation is actually on.
-    if (m->has_frame_interp && m->s.renderer) {
-        row_label("Frame interpolation", th);
-        bool fi = m->s.frame_interp != 0;
-        if (ImGui::Checkbox("##fi", &fi)) launcher_model_toggle_frame_interp(m);
-        if (m->s.frame_interp) {
-            row_label("Presentation target", th);
-            if (ImGui::Button(launcher_model_interp_fps_label(m), ImVec2(px(150), px(30))))
-                launcher_model_cycle_interp_fps(m);
-        }
     }
 
     // VSync sits with frame interpolation because both decide how a finished

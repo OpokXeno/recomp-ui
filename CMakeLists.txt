@@ -114,6 +114,9 @@ if(BUILD_TESTING)
         src/consoles/psx/psx_binds.c)
     target_include_directories(recomp-ui-psx-binds-test PRIVATE
         src src/common src/consoles/psx)
+    if(SNESRECOMP_SDL_BACKEND STREQUAL "SDL3")
+        target_compile_definitions(recomp-ui-psx-binds-test PRIVATE LNG_SDL3=1)
+    endif()
     target_link_libraries(recomp-ui-psx-binds-test PRIVATE ${RUI_SDL_TARGET})
     add_test(
         NAME recomp-ui-psx-binds

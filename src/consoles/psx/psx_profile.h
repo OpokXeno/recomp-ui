@@ -145,17 +145,18 @@ static inline void launcher_profile_apply_psx(RecompLauncherCGameInfo* gi) {
     // Controller: PSX has analog/digital pad modes + swapping DualShock art.
     gi->pad_mode_supported  = 1;
     gi->pad_mode_selectable = 1;       // per-game lock_mode may set this to 0
-    /* Display enhancements are mod-owned on PSX. Keep the generic View mode,
-     * Frame interpolation, and Skip FMVs rows absent by default; trusted game
-     * plugins activate those features after launcher resolution. */
+    /* The legacy frame-interpolation capability flag drives the PSX launcher's
+     * 30/60 FPS row. Actual frame interpolation and Skip FMVs remain mod-owned;
+     * the host supplies per-title widescreen capabilities. */
     gi->widescreen_supported = 0;
     gi->aspect_mask           = 0;
     // Full PS1 settings surface.
-    gi->has_window_size = 1; gi->has_renderer = 1; gi->has_supersampling = 1;
+    gi->has_window_size = 1; gi->has_renderer = 0; gi->has_supersampling = 1;
     gi->has_antialiasing = 1; gi->has_texture_filter = 1; gi->has_screen_kind = 1;
+    gi->has_geometry_precision = 0; /* PGXP is framework-owned, not launcher UI. */
     gi->has_fmv_filter = 1;    /* MDEC decodes video at native res; how it is
                                 * scaled to the window is a player choice. */
-    gi->has_frame_interp = 0; gi->has_spu_hq = 1; gi->has_skip_fmv = 0;
+    gi->has_frame_interp = 1; gi->has_spu_hq = 1; gi->has_skip_fmv = 0;
     gi->has_turbo_loads = 1; gi->has_bios = 1;
     gi->has_deadzone_pct = 1;
     gi->has_rewind_depth = RECOMP_UI_PSX_HAS_REWIND ? 1 : 0;

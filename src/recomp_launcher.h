@@ -673,6 +673,11 @@ struct RecompLauncherCSettings {
      * zero-initialized host predating this field could not be told apart from
      * "no opinion". Appended additively. */
     int  vsync;
+
+    /* PSX presentation rate: 30 = original cadence, 60 = Native interpolation.
+     * Zero-initialized hosts use the launcher's 30 FPS default. Appended for
+     * ABI stability. */
+    int  fps;
 };
 
 /* Values for RecompLauncherCSettings.vsync (1-based; 0 = unset). */
@@ -810,7 +815,7 @@ typedef struct RecompLauncherCGameInfo {
     int  has_antialiasing;
     int  has_texture_filter;    // Nearest/Bilinear (else the legacy Linear filtering checkbox stays)
     int  has_screen_kind;       // CRT/screen-model filter
-    int  has_frame_interp;
+    int  has_frame_interp;         // PSX 30/60 FPS selector
     int  has_spu_hq;
     int  has_skip_fmv;          // Skip FMVs
     int  has_turbo_loads;
