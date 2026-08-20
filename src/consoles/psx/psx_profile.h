@@ -66,10 +66,10 @@ static const char* const kPanelsSettingsPsx[]   =
     { "video", "audio", "input", "system", "hotkeys", NULL };
 
 // ---- ROM (disc) file-picker filter ----------------------------------------------
-// Cue sheets only (Redump-style). Track .bin files sit beside the .cue; bare
-// .iso/.bin/.img are not offered in the picker — generate/boot need a TOC.
+// Supported PlayStation disc images. CUE/BIN pairs preserve the full track
+// layout; CHD images can be selected directly.
 static const char* const kPsxDiscPatterns[] = {
-    "*.cue",
+    "*.cue", "*.bin", "*.chd",
 };
 #define LNG_PSX_DISC_PATTERN_COUNT \
     ((int)(sizeof(kPsxDiscPatterns) / sizeof(kPsxDiscPatterns[0])))
@@ -121,7 +121,7 @@ static const SystemProfile kSystemProfilePsx = {
     /* screen_kind_names */ NULL,   /* legacy Raw/CRT/Composite/Trinitron set */
     /* screen_kind_count */ 0,
     /* rom_filter        */ { kPsxDiscPatterns, LNG_PSX_DISC_PATTERN_COUNT,
-                              "PlayStation disc (.cue)" },
+                              "PlayStation disc (.cue/.bin, .chd)" },
     /* renderer_labels   */ NULL,
     /* hide_audio_freq   */ 0,
     /* brand             */ "brand_psx.tga",

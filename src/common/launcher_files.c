@@ -18,7 +18,7 @@
 
 /* True if path's filename matches any "*.ext" / "*.*" pattern (case-insensitive).
  * Used after native pick so typed paths / residual All-Files bypasses cannot
- * accept a PSX track .bin when the picker asked for *.cue only. */
+ * accept a PSX track .bin when the picker asked for cue/CHD images only. */
 static int launcher_path_matches_patterns(const char* path,
                                           const char* const* patterns,
                                           int num_patterns) {

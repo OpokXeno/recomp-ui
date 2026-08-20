@@ -101,7 +101,7 @@ typedef struct { int mode; /* 0 rom-hash, 1 disc-verdict */ VerifyProbeFn probe;
 
 // ---- ROM file-picker filter --------------------------------------------------
 // The native "Change ROM" dialog's extension filter, per console — so a GBA
-// game offers *.gba, a PSX game *.cue/*.bin, never a hardcoded SNES set.
+// game offers *.gba, a PSX game *.cue/*.chd, never a hardcoded SNES set.
 // patterns is a tinyfiledialogs glob list ("*.gba"); desc is the filter label.
 typedef struct {
     const char* const* patterns; int pattern_count;

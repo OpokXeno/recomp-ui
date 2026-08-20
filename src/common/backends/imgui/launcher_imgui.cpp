@@ -7338,8 +7338,8 @@ void draw_setup_wizard_modal(LauncherModel* m, const LauncherTheme& th) {
         if (plat == SETUP_PLAT_PSX && m->has_bios) {
             ImGui::TextColored(col(th.text_muted),
                 "This build is already generated. Select a PlayStation BIOS "
-                "(or keep OpenBIOS) and a Redump-style .cue with sibling .bin "
-                "tracks so %s can launch. Your previous disc/BIOS picks were "
+                "(or keep OpenBIOS) and a PlayStation disc image (.cue/.bin or "
+                ".chd) so %s can launch. Your previous disc/BIOS picks were "
                 "cleared from settings.",
                 game);
         } else if (m->has_bios) {
@@ -7362,8 +7362,8 @@ void draw_setup_wizard_modal(LauncherModel* m, const LauncherTheme& th) {
                 "%s needs a playable %s before you can launch. This build includes "
                 "a bundled BIOS (OpenBIOS) by default. Setup also looks for a "
                 "retail SCPH1001.BIN beside the install and uses it when found; "
-                "otherwise OpenBIOS stays selected. Use a Redump-style .cue with "
-                "sibling .bin tracks (.iso is not accepted). Pick your %s below "
+                "otherwise OpenBIOS stays selected. Use a .cue/.bin pair or "
+                ".chd image. Pick your %s below "
                 "(you must legally own these dumps).",
                 game, noun, noun);
         } else if (plat == SETUP_PLAT_GBA && m->has_bios) {
@@ -7461,12 +7461,12 @@ void draw_setup_wizard_modal(LauncherModel* m, const LauncherTheme& th) {
          * TextLinkOpenURL after a wrapped line leaves a huge empty gap in
          * BeginPopupModal (Windows first-run wizard regression). */
         ImGui::TextColored(col(th.text_muted),
-            "NOTE: psxrecomp games require a .cue + .bin dump of the disc. "
+            "NOTE: psxrecomp games accept .cue/.bin or .chd disc images. "
             "Note the number of tracks required by this project; multitrack "
             "discs are often Redump-formatted dumps. You can generate your own "
             "from the original disc with redumper "
             "(https://github.com/superg/redumper). You cannot convert a "
-            "single-track .bin or .iso to multitrack.");
+            "single-track .bin to multitrack.");
         ImGui::PopTextWrapPos();
         setup_url_link("Open redumper", "https://github.com/superg/redumper");
         ImGui::PushTextWrapPos(wrap_x);
@@ -7501,7 +7501,7 @@ void draw_setup_wizard_modal(LauncherModel* m, const LauncherTheme& th) {
             char title[96];
             if (plat == SETUP_PLAT_PSX)
                 std::snprintf(title, sizeof(title),
-                              "Select %s (.cue)", noun);
+                              "Select %s (.cue/.bin, .chd)", noun);
             else
                 std::snprintf(title, sizeof(title), "Select %s", noun);
             if (prof && prof->rom_filter.pattern_count > 0)
@@ -7516,8 +7516,7 @@ void draw_setup_wizard_modal(LauncherModel* m, const LauncherTheme& th) {
             draw_verdict_block(m, th, ImGui::GetContentRegionAvail().x);
         if (plat == SETUP_PLAT_PSX && m->rom_present && m->rom_full[0]) {
             const char* ext = strrchr(m->rom_full, '.');
-            if (ext && (lps_streq_ci(ext, ".bin") || lps_streq_ci(ext, ".img") ||
-                        lps_streq_ci(ext, ".car"))) {
+            if (ext && (lps_streq_ci(ext, ".bin") || lps_streq_ci(ext, ".car"))) {
                 ImGui::PushTextWrapPos(wrap_x);
                 ImGui::TextColored(col(th.warn),
                     "You picked a track image (%s). Prefer the matching .cue "
@@ -7582,18 +7581,20 @@ void draw_setup_wizard_modal(LauncherModel* m, const LauncherTheme& th) {
                     launcher_model_start_prepare_disc(m, m->rom_full);
             } else {
                 char buf[512];
-                static const char* kPsxCueOnly[] = { "*.cue" };
+                static const char* kPsxDiscPatterns[] = {
+                    "*.cue", "*.bin", "*.chd" };
                 static const char* kDumpPatterns[] = {
                     "*.cue", "*.iso", "*.bin", "*.img", "*.car", "*.chd", "*.*" };
                 const char* const* pats =
-                    (plat == SETUP_PLAT_PSX) ? kPsxCueOnly : kDumpPatterns;
-                const int npat = (plat == SETUP_PLAT_PSX) ? 1 : 7;
+                    (plat == SETUP_PLAT_PSX) ? kPsxDiscPatterns : kDumpPatterns;
+                const int npat = (plat == SETUP_PLAT_PSX) ? 3 : 7;
                 if (launcher_pick_file(
                         plat == SETUP_PLAT_PSX
-                            ? "Select disc (.cue)"
+                            ? "Select disc (.cue/.bin, .chd)"
                             : "Select raw disc dump to convert",
                         pats, npat,
-                        plat == SETUP_PLAT_PSX ? "PlayStation disc (.cue)"
+                        plat == SETUP_PLAT_PSX
+                            ? "PlayStation disc (.cue/.bin, .chd)"
                                                : "Disc dump",
                         buf, sizeof(buf)))
                     launcher_model_start_prepare_disc(m, buf);
