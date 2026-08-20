@@ -73,6 +73,57 @@ static int launcher_reject_if_pattern_mismatch(const char* title,
     return 1;
 }
 
+int launcher_parse_file_list(const char* selected, char* out_paths,
+                             size_t out_cap) {
+    if (!out_paths || out_cap == 0) return -1;
+    if (!selected || !selected[0]) {
+        out_paths[0] = '\0';
+        return 0;
+    }
+
+    size_t begin = 0;
+    size_t used = 0;
+    int count = 0;
+    for (size_t pos = 0;; ++pos) {
+        const char c = selected[pos];
+        if (c != '|' && c != '\r' && c != '\n' && c != '\0') continue;
+        if (pos > begin) {
+            const size_t length = pos - begin;
+            if (used + length + 2 > out_cap) {
+                out_paths[0] = '\0';
+                return -1;
+            }
+            memmove(out_paths + used, selected + begin, length);
+            used += length;
+            out_paths[used++] = '\0';
+            ++count;
+        }
+        if (c == '\0') break;
+        begin = pos + 1;
+    }
+    if (count == 0) return 0;
+    out_paths[used] = '\0';
+    return count;
+}
+
+static int launcher_reject_file_list_pattern_mismatch(
+    const char* title, const char* const* patterns, int num_patterns,
+    char* paths, int path_count) {
+    const char* path = paths;
+    for (int i = 0; i < path_count; ++i) {
+        if (!launcher_path_matches_patterns(path, patterns, num_patterns)) {
+            tinyfd_messageBox(
+                title && title[0] ? title : "Select files",
+                "At least one selected file type is not allowed for this picker.",
+                "ok", "warning", 1);
+            paths[0] = '\0';
+            return 1;
+        }
+        path += strlen(path) + 1;
+    }
+    return 0;
+}
+
 #if defined(__linux__)
 #include <ctype.h>
 #include <errno.h>
@@ -190,6 +241,66 @@ static int linux_spawn_capture(char* const argv[], char* out, size_t out_cap) {
     return 1;
 }
 
+static int linux_spawn_capture_files(char* const argv[], char* out,
+                                     size_t out_cap) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -1;
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
+                                     O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+    pid_t pid = 0;
+    const int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]);
+    if (rc != 0) {
+        close(pipefd[0]);
+        return -1;
+    }
+
+    size_t used = 0;
+    int overflow = 0;
+    for (;;) {
+        char buffer[4096];
+        const ssize_t got = read(pipefd[0], buffer, sizeof(buffer));
+        if (got == 0) break;
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            overflow = 1;
+            break;
+        }
+        const size_t amount = (size_t)got;
+        if (amount >= out_cap - used) {
+            overflow = 1;
+        } else if (!overflow) {
+            memcpy(out + used, buffer, amount);
+            used += amount;
+        }
+    }
+    close(pipefd[0]);
+    if (out_cap) out[overflow ? 0 : used] = '\0';
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (!WIFEXITED(status) || overflow) return -1;
+    if (WEXITSTATUS(status) != 0 || used == 0) {
+        out[0] = '\0';
+        return 0;
+    }
+    return launcher_parse_file_list(out, out, out_cap);
+}
+
 static void linux_append_patterns(char* dst, size_t dst_cap,
                                   const char* const* patterns, int num_patterns) {
     dst[0] = '\0';
@@ -269,6 +380,46 @@ static int linux_pick_open_kdialog(const char* title, const char* const* pattern
         NULL
     };
     return linux_spawn_capture(argv, out, out_cap);
+}
+
+static int linux_pick_open_multiple_zenity(
+    const char* title, const char* const* patterns, int num_patterns,
+    const char* desc, char* out, size_t out_cap) {
+    char title_arg[640];
+    char filter_arg[768];
+    char pats[256];
+    linux_append_patterns(pats, sizeof(pats), patterns, num_patterns);
+    snprintf(title_arg, sizeof(title_arg), "--title=%s",
+             title && title[0] ? title : "Select files");
+    if (desc && desc[0])
+        snprintf(filter_arg, sizeof(filter_arg), "--file-filter=%s | %s", desc, pats);
+    else
+        snprintf(filter_arg, sizeof(filter_arg), "--file-filter=%s", pats);
+    char* argv[] = {
+        "zenity", "--file-selection", "--multiple", "--separator=|",
+        title_arg, filter_arg, NULL
+    };
+    return linux_spawn_capture_files(argv, out, out_cap);
+}
+
+static int linux_pick_open_multiple_kdialog(
+    const char* title, const char* const* patterns, int num_patterns,
+    const char* desc, char* out, size_t out_cap) {
+    char filter[768];
+    char pats[256];
+    char title_buf[512];
+    linux_append_patterns(pats, sizeof(pats), patterns, num_patterns);
+    if (desc && desc[0])
+        snprintf(filter, sizeof(filter), "%s | %s", pats, desc);
+    else
+        snprintf(filter, sizeof(filter), "%s", pats);
+    snprintf(title_buf, sizeof(title_buf), "%s",
+             title && title[0] ? title : "Select files");
+    char* argv[] = {
+        "kdialog", "--getopenfilename", ".", filter, "--multiple",
+        "--separate-output", "--title", title_buf, NULL
+    };
+    return linux_spawn_capture_files(argv, out, out_cap);
 }
 
 static int linux_pick_save_zenity(const char* title, const char* const* patterns,
@@ -383,6 +534,31 @@ static int linux_pick_open(const char* title, const char* const* patterns,
     }
     if (!want_kd && have_kd) {
         r = linux_pick_open_kdialog(title, patterns, num_patterns, desc, out, out_cap);
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
+static int linux_pick_open_multiple(
+    const char* title, const char* const* patterns, int num_patterns,
+    const char* desc, char* out, size_t out_cap) {
+    const int want_kd = linux_desktop_prefers_kdialog();
+    const int have_kd = linux_have_cmd("kdialog");
+    const int have_zn = linux_have_cmd("zenity");
+    int r;
+    if (want_kd && have_kd) {
+        r = linux_pick_open_multiple_kdialog(
+            title, patterns, num_patterns, desc, out, out_cap);
+        if (r >= 0) return r;
+    }
+    if (have_zn) {
+        r = linux_pick_open_multiple_zenity(
+            title, patterns, num_patterns, desc, out, out_cap);
+        if (r >= 0) return r;
+    }
+    if (!want_kd && have_kd) {
+        r = linux_pick_open_multiple_kdialog(
+            title, patterns, num_patterns, desc, out, out_cap);
         if (r >= 0) return r;
     }
     return -1;
@@ -523,6 +699,28 @@ bool launcher_pick_file(const char* title, const char* const* patterns, int num_
     const int r = launcher_try_pick_file(title, patterns, num_patterns, desc,
                                          out_path, out_cap);
     return r == 1;
+}
+
+int launcher_pick_files(const char* title, const char* const* patterns,
+                        int num_patterns, const char* desc,
+                        char* out_paths, size_t out_cap) {
+    if (!out_paths || out_cap < 2) return -1;
+    out_paths[0] = '\0';
+#if defined(__linux__)
+    const int count = linux_pick_open_multiple(
+        title, patterns, num_patterns, desc, out_paths, out_cap);
+#else
+    const char* selected = tinyfd_openFileDialog(
+        title ? title : "Select files", "",
+        num_patterns > 0 ? num_patterns : 0,
+        num_patterns > 0 ? patterns : NULL, desc, 1);
+    const int count = launcher_parse_file_list(selected, out_paths, out_cap);
+#endif
+    if (count <= 0) return count;
+    if (launcher_reject_file_list_pattern_mismatch(
+            title, patterns, num_patterns, out_paths, count))
+        return 0;
+    return count;
 }
 
 bool launcher_pick_save_file(const char* title, const char* const* patterns, int num_patterns,

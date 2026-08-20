@@ -53,6 +53,19 @@ bool launcher_pick_folder(const char* title, char* out_path, size_t out_cap);
 bool launcher_pick_file(const char* title, const char* const* patterns, int num_patterns,
                         const char* desc, char* out_path, size_t out_cap);
 
+// Open the OS file dialog with multiple selection enabled. Selected paths are
+// returned as consecutive NUL-terminated strings followed by an extra NUL.
+// Returns the number of paths, 0 on cancel, or -1 when no native picker can run
+// or the output buffer is too small.
+int launcher_pick_files(const char* title, const char* const* patterns,
+                        int num_patterns, const char* desc,
+                        char* out_paths, size_t out_cap);
+
+// Normalize a native picker result separated by '|', CR, or LF into the list
+// representation used by launcher_pick_files. Exposed for focused tests.
+int launcher_parse_file_list(const char* selected, char* out_paths,
+                             size_t out_cap);
+
 // Like launcher_pick_file, but returns a tri-state so UIs can fall back to an
 // in-app browser when the native dialog cannot run:
 //   1  — path selected (out_path filled)

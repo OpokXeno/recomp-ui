@@ -131,6 +131,15 @@ if(BUILD_TESTING)
         NAME recomp-ui-psx-profile
         COMMAND $<TARGET_FILE:recomp-ui-psx-profile-test>)
 
+    add_executable(recomp-ui-launcher-files-test
+        tests/launcher_files_test.c
+        src/common/launcher_files.c
+        src/third_party/tinyfiledialogs.c)
+    target_include_directories(recomp-ui-launcher-files-test PRIVATE src)
+    add_test(
+        NAME recomp-ui-launcher-files
+        COMMAND $<TARGET_FILE:recomp-ui-launcher-files-test>)
+
     add_executable(recomp-runtime-ui-imgui-test
         tests/runtime_ui_imgui_test.cpp
         src/common/recomp_runtime_ui.c

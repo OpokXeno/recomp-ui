@@ -5891,6 +5891,61 @@ static void mod_note_error(LauncherModel* m) {
                   error && error[0] ? error : "The mod operation failed.");
 }
 
+static const char* mod_archive_filename(const char* path) {
+    const char* slash = path ? std::strrchr(path, '/') : nullptr;
+    const char* backslash = path ? std::strrchr(path, '\\') : nullptr;
+    const char* separator = !slash || (backslash && backslash > slash)
+                                ? backslash
+                                : slash;
+    return separator ? separator + 1 : path;
+}
+
+static void install_mod_archive_list(LauncherModel* m, const char* paths,
+                                     int path_count) {
+    const auto* mods = m ? m->mods : nullptr;
+    if (!m || !mods || !paths || path_count <= 0) return;
+    int installed = 0;
+    int failed = 0;
+    char first_failure[192] = {};
+    const char* path = paths;
+    for (int index = 0; index < path_count; ++index) {
+        if (mods->install_archive && mods->install_archive(mods->ctx, path)) {
+            ++installed;
+        } else {
+            ++failed;
+            if (!first_failure[0]) {
+                const char* error = mods->last_error
+                                        ? mods->last_error(mods->ctx)
+                                        : nullptr;
+                std::snprintf(first_failure, sizeof(first_failure), "%s: %s",
+                              mod_archive_filename(path),
+                              error && error[0] ? error : "installation failed");
+            }
+        }
+        path += std::strlen(path) + 1;
+    }
+    if (failed == 0) {
+        if (installed == 1) {
+            std::snprintf(
+                m->mod_status, sizeof(m->mod_status),
+                "Package installed. Changes apply when you press PLAY.");
+        } else {
+            std::snprintf(
+                m->mod_status, sizeof(m->mod_status),
+                "%d packages installed. Changes apply when you press PLAY.",
+                installed);
+        }
+    } else if (installed > 0) {
+        std::snprintf(m->mod_status, sizeof(m->mod_status),
+                      "%d installed; %d failed. %s", installed, failed,
+                      first_failure);
+    } else {
+        std::snprintf(m->mod_status, sizeof(m->mod_status),
+                      "%d package installation%s failed. %s", failed,
+                      failed == 1 ? "" : "s", first_failure);
+    }
+}
+
 static bool mod_commit_launch(LauncherModel* m) {
     if (!m || !m->mods || !m->mods->commit ||
         m->mods->commit(m->mods->ctx, launcher_model_rom_path(m))) {
@@ -6038,16 +6093,15 @@ static void draw_mod_packages(LauncherModel* m, const LauncherTheme& th) {
                   "*%s", archive_extension);
     if (ImGui::Button(install_label)) {
         const char* patterns[] = { archive_pattern };
-        char path[1024];
-        if (launcher_pick_file("Install Mod Package", patterns, 1,
-                               archive_description,
-                               path, sizeof(path))) {
-            if (!mods->install_archive || !mods->install_archive(mods->ctx, path))
-                mod_note_error(m);
-            else
-                std::snprintf(m->mod_status, sizeof(m->mod_status),
-                              "Package installed. Changes apply when you press PLAY.");
-        }
+        char paths[64 * 1024];
+        const int selected = launcher_pick_files(
+            "Install Mod Packages", patterns, 1, archive_description,
+            paths, sizeof(paths));
+        if (selected > 0)
+            install_mod_archive_list(m, paths, selected);
+        else if (selected < 0)
+            std::snprintf(m->mod_status, sizeof(m->mod_status),
+                          "No native multi-file picker is available.");
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(px(300));
@@ -6470,18 +6524,15 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
                   "*%s", archive_extension);
     if (ImGui::Button(install_label)) {
         const char* patterns[] = { archive_pattern };
-        char path[1024];
-        if (launcher_pick_file("Install Mod Package", patterns, 1,
-                               archive_description,
-                               path, sizeof(path))) {
-            if (!mods->install_archive ||
-                !mods->install_archive(mods->ctx, path)) {
-                mod_note_error(m);
-            } else {
-                std::snprintf(m->mod_status, sizeof(m->mod_status),
-                              "Package installed. Changes apply when you press PLAY.");
-            }
-        }
+        char paths[64 * 1024];
+        const int selected = launcher_pick_files(
+            "Install Mod Packages", patterns, 1, archive_description,
+            paths, sizeof(paths));
+        if (selected > 0)
+            install_mod_archive_list(m, paths, selected);
+        else if (selected < 0)
+            std::snprintf(m->mod_status, sizeof(m->mod_status),
+                          "No native multi-file picker is available.");
     }
     ImGui::SameLine();
     if (ImGui::Button("Enable all"))
