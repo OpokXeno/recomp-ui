@@ -318,6 +318,11 @@ typedef struct RecompLauncherCModFeature {
      * conditionally presents camera bindings and the Mods detail links there.
      * Appended for ABI stability; zero keeps every existing feature unchanged. */
     int  camera_controls;
+    /* An enabled incompatible package currently prevents this feature from
+     * being selected. The provider owns conflict resolution and supplies the
+     * display name so the UI never cross-references package manifests. */
+    int  blocked;
+    char blocked_by[128];
 } RecompLauncherCModFeature;
 
 typedef struct RecompLauncherCModOption {

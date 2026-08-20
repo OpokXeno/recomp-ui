@@ -5900,32 +5900,45 @@ static const char* mod_archive_filename(const char* path) {
     return separator ? separator + 1 : path;
 }
 
-static void install_mod_archive_list(LauncherModel* m, const char* paths,
-                                     int path_count) {
-    const auto* mods = m ? m->mods : nullptr;
-    if (!m || !mods || !paths || path_count <= 0) return;
+struct ModInstallState {
+    LauncherModel* owner = nullptr;
+    std::vector<std::string> paths;
+    size_t next = 0;
     int installed = 0;
     int failed = 0;
-    char first_failure[192] = {};
+    std::string first_failure;
+    bool announced = false;
+    bool active = false;
+};
+
+static ModInstallState& mod_install_state() {
+    static ModInstallState state;
+    return state;
+}
+
+static void queue_mod_archive_list(LauncherModel* m, const char* paths,
+                                   int path_count) {
+    if (!m || !m->mods || !paths || path_count <= 0) return;
+    ModInstallState& state = mod_install_state();
+    if (state.active && state.owner != m) state = {};
+    if (state.active) return;
+    state = {};
+    state.owner = m;
+    state.active = true;
     const char* path = paths;
     for (int index = 0; index < path_count; ++index) {
-        if (mods->install_archive && mods->install_archive(mods->ctx, path)) {
-            ++installed;
-        } else {
-            ++failed;
-            if (!first_failure[0]) {
-                const char* error = mods->last_error
-                                        ? mods->last_error(mods->ctx)
-                                        : nullptr;
-                std::snprintf(first_failure, sizeof(first_failure), "%s: %s",
-                              mod_archive_filename(path),
-                              error && error[0] ? error : "installation failed");
-            }
-        }
+        state.paths.emplace_back(path);
         path += std::strlen(path) + 1;
     }
-    if (failed == 0) {
-        if (installed == 1) {
+    std::snprintf(m->mod_status, sizeof(m->mod_status),
+                  "Preparing to install %zu package%s...", state.paths.size(),
+                  state.paths.size() == 1 ? "" : "s");
+}
+
+static void finish_mod_archive_install(LauncherModel* m,
+                                       ModInstallState& state) {
+    if (state.failed == 0) {
+        if (state.installed == 1) {
             std::snprintf(
                 m->mod_status, sizeof(m->mod_status),
                 "Package installed. Changes apply when you press PLAY.");
@@ -5933,17 +5946,91 @@ static void install_mod_archive_list(LauncherModel* m, const char* paths,
             std::snprintf(
                 m->mod_status, sizeof(m->mod_status),
                 "%d packages installed. Changes apply when you press PLAY.",
-                installed);
+                state.installed);
         }
-    } else if (installed > 0) {
+    } else if (state.installed > 0) {
         std::snprintf(m->mod_status, sizeof(m->mod_status),
-                      "%d installed; %d failed. %s", installed, failed,
-                      first_failure);
+                      "%d installed; %d failed. %s", state.installed,
+                      state.failed, state.first_failure.c_str());
     } else {
         std::snprintf(m->mod_status, sizeof(m->mod_status),
-                      "%d package installation%s failed. %s", failed,
-                      failed == 1 ? "" : "s", first_failure);
+                      "%d package installation%s failed. %s", state.failed,
+                      state.failed == 1 ? "" : "s",
+                      state.first_failure.c_str());
     }
+    state.active = false;
+}
+
+static void process_mod_archive_install(LauncherModel* m) {
+    ModInstallState& state = mod_install_state();
+    if (!m || state.owner != m || !state.active) return;
+    if (state.next >= state.paths.size()) {
+        finish_mod_archive_install(m, state);
+        return;
+    }
+    const std::string& path = state.paths[state.next];
+    if (!state.announced) {
+        std::snprintf(m->mod_status, sizeof(m->mod_status),
+                      "Installing package %zu of %zu: %s", state.next + 1,
+                      state.paths.size(), mod_archive_filename(path.c_str()));
+        state.announced = true;
+        return;
+    }
+
+    const auto* mods = m->mods;
+    if (mods && mods->install_archive &&
+        mods->install_archive(mods->ctx, path.c_str())) {
+        ++state.installed;
+    } else {
+        ++state.failed;
+        if (state.first_failure.empty()) {
+            const char* error = mods && mods->last_error
+                                    ? mods->last_error(mods->ctx)
+                                    : nullptr;
+            state.first_failure = mod_archive_filename(path.c_str());
+            state.first_failure += ": ";
+            state.first_failure +=
+                error && error[0] ? error : "installation failed";
+        }
+    }
+    ++state.next;
+    state.announced = false;
+    if (state.next >= state.paths.size())
+        finish_mod_archive_install(m, state);
+}
+
+static void draw_mod_archive_install_progress(LauncherModel* m,
+                                              const LauncherTheme& th) {
+    ModInstallState& state = mod_install_state();
+    if (!m || state.owner != m) return;
+    if (state.active) ImGui::OpenPopup("Installing mod packages");
+    ImGui::SetNextWindowSize(ImVec2(px(500), 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(
+            "Installing mod packages", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+        if (!state.active) state = {};
+        return;
+    }
+    if (!state.active) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        state = {};
+        return;
+    }
+    ImGui::TextColored(col(th.accent2), "Installing packages...");
+    ImGui::TextWrapped("%s", m->mod_status);
+    const float progress = state.paths.empty()
+        ? 0.0f
+        : static_cast<float>(state.next) /
+              static_cast<float>(state.paths.size());
+    char overlay[64];
+    std::snprintf(overlay, sizeof(overlay), "%zu / %zu", state.next,
+                  state.paths.size());
+    ImGui::ProgressBar(progress, ImVec2(px(440), 0), overlay);
+    ImGui::TextColored(
+        col(th.text_muted),
+        "The launcher will continue with the next package automatically.");
+    ImGui::EndPopup();
 }
 
 static bool mod_commit_launch(LauncherModel* m) {
@@ -6098,7 +6185,7 @@ static void draw_mod_packages(LauncherModel* m, const LauncherTheme& th) {
             "Install Mod Packages", patterns, 1, archive_description,
             paths, sizeof(paths));
         if (selected > 0)
-            install_mod_archive_list(m, paths, selected);
+            queue_mod_archive_list(m, paths, selected);
         else if (selected < 0)
             std::snprintf(m->mod_status, sizeof(m->mod_status),
                           "No native multi-file picker is available.");
@@ -6529,7 +6616,7 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
             "Install Mod Packages", patterns, 1, archive_description,
             paths, sizeof(paths));
         if (selected > 0)
-            install_mod_archive_list(m, paths, selected);
+            queue_mod_archive_list(m, paths, selected);
         else if (selected < 0)
             std::snprintf(m->mod_status, sizeof(m->mod_status),
                           "No native multi-file picker is available.");
@@ -6602,6 +6689,8 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
                     ImGui::PushID(feature.id);
 
                     bool enabled = feature.enabled != 0;
+                    const bool blocked = feature.blocked != 0 && !enabled;
+                    if (blocked) ImGui::BeginDisabled();
                     if (ImGui::Checkbox("##enabled", &enabled)) {
                         if (!mods->feature_enable(
                                 mods->ctx, feature.package_id, feature.id,
@@ -6609,7 +6698,14 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
                             mod_note_error(m);
                         }
                     }
-                    if (ImGui::IsItemHovered())
+                    const bool enable_hovered = ImGui::IsItemHovered(
+                        blocked ? ImGuiHoveredFlags_AllowWhenDisabled
+                                : ImGuiHoveredFlags_None);
+                    if (blocked) ImGui::EndDisabled();
+                    if (enable_hovered && blocked)
+                        ImGui::SetTooltip("Unavailable while %s is enabled",
+                                          feature.blocked_by);
+                    else if (enable_hovered)
                         ImGui::SetTooltip("%s %s", enabled ? "Disable" : "Enable",
                                           feature.name);
                     ImGui::SameLine();
@@ -6625,13 +6721,16 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
                                   feature.name,
                                   feature.package_name[0] ? feature.package_name
                                                           : feature.package_id,
-                                  feature.package_version[0] ? "  " : "",
-                                  feature.package_version);
+                                   feature.package_version[0] ? "  " : "",
+                                   feature.package_version);
+                    if (blocked)
+                        ImGui::PushStyleColor(ImGuiCol_Text, col(th.text_muted));
                     if (ImGui::Selectable(
                             label, m->mod_selected == item.index, 0,
                             ImVec2(0, px(44)))) {
                         m->mod_selected = item.index;
                     }
+                    if (blocked) ImGui::PopStyleColor();
                     ImGui::PopID();
                     ImGui::PopID();
                 }
@@ -6822,6 +6921,7 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
 void draw_mods(LauncherModel* m, const LauncherTheme& th) {
     const auto* mods = m ? m->mods : nullptr;
     if (!mods) return;
+    process_mod_archive_install(m);
     const bool feature_provider =
         mods->feature_count && mods->feature_get &&
         mods->feature_option_get && mods->feature_enable &&
@@ -6841,6 +6941,7 @@ void draw_mods(LauncherModel* m, const LauncherTheme& th) {
         draw_mod_packages(m, th);
     else
         draw_mod_features(m, th);
+    draw_mod_archive_install_progress(m, th);
 }
 
 // ---- panel registry: id -> {view, slot, available, draw} --------------------
