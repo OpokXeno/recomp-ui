@@ -208,6 +208,7 @@ void launcher_model_init(LauncherModel* m,
         m->has_skip_fmv         = game->has_skip_fmv != 0;
         m->has_turbo_loads      = game->has_turbo_loads != 0;
         m->has_geometry_precision = game->has_geometry_precision != 0;
+        m->has_dithering        = game->has_dithering != 0;
         // game->has_fullscreen_toggle is deliberately NOT read: the Fullscreen
         // row is universal (drawn for every console) — see recomp_launcher.h.
         m->has_bios             = game->has_bios != 0;
@@ -1217,6 +1218,10 @@ void launcher_model_toggle_geometry_correction(LauncherModel* m) {
 
 void launcher_model_toggle_perspective_texturing(LauncherModel* m) {
     m->s.perspective_texturing = !m->s.perspective_texturing;
+}
+
+void launcher_model_toggle_dithering(LauncherModel* m) {
+    m->s.dither_force_off = !m->s.dither_force_off;
 }
 
 /* Sub-pixel vertices are only observable in the supersampled mirror: at 1x the

@@ -19,6 +19,7 @@ int main(void) {
     /* Unrelated PSX Display capabilities remain available. */
     assert(game.has_renderer == 0);
     assert(game.has_geometry_precision == 0);
+    assert(game.has_dithering == 1);
     assert(game.has_supersampling == 1);
     assert(game.has_screen_kind == 1);
     assert(game.has_vsync == 1);

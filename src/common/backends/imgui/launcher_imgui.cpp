@@ -2272,7 +2272,7 @@ bool any_deep_display(const LauncherModel* m) {
            m->has_antialiasing || m->has_texture_filter || m->has_screen_kind ||
            m->has_fmv_filter ||
            m->has_frame_interp || m->has_skip_fmv ||
-           m->has_geometry_precision ||
+           m->has_geometry_precision || m->has_dithering ||
            m->has_rewind_depth || m->has_vsync;
            /* has_turbo_loads is intentionally absent: it draws no row (below). */
 }
@@ -2614,6 +2614,24 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
                               "camera moves.\n\nApplied only to polygons the "
                               "runtime can prove came from the 3D pipeline, so "
                               "2D art and menus are left alone.");
+    }
+
+    if (m->has_dithering) {
+        // Master on/off for the PS1's ordered dither pattern. Default ON
+        // (faithful): the game's own GP0(E1) dither bit decides per
+        // primitive exactly as always. Off forces dithering off everywhere,
+        // for a smoother look on a modern display. Stored inverted
+        // (dither_force_off) so a zero-initialized host keeps the faithful
+        // default; see psxrecomp ENHANCEMENTS.md G2.
+        row_label("Dithering", th);
+        bool dithering_on = m->s.dither_force_off == 0;
+        if (ImGui::Checkbox("##dithering", &dithering_on))
+            launcher_model_toggle_dithering(m);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Smooths 15-bit color banding with the "
+                              "original PS1's dither pattern.\n\nTurn off "
+                              "for a smoother, less grainy look on a modern "
+                              "display.");
     }
 
     if (m->has_screen_kind) {

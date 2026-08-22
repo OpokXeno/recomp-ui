@@ -154,6 +154,8 @@ static inline void launcher_profile_apply_psx(RecompLauncherCGameInfo* gi) {
     gi->has_window_size = 1; gi->has_renderer = 0; gi->has_supersampling = 1;
     gi->has_antialiasing = 1; gi->has_texture_filter = 1; gi->has_screen_kind = 1;
     gi->has_geometry_precision = 0; /* PGXP is framework-owned, not launcher UI. */
+    gi->has_dithering = 1;     /* Master dithering on/off; a plain renderer
+                                * toggle, not per-title validated content. */
     gi->has_fmv_filter = 1;    /* MDEC decodes video at native res; how it is
                                 * scaled to the window is a player choice. */
     gi->has_frame_interp = 1; gi->has_spu_hq = 1; gi->has_skip_fmv = 0;
