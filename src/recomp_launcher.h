@@ -683,6 +683,15 @@ struct RecompLauncherCSettings {
      * Zero-initialized hosts use the launcher's 30 FPS default. Appended for
      * ABI stability. */
     int  fps;
+
+    /* Master override for the PS1's ordered dither pattern
+     * (Settings.dithering). Stored INVERTED (0 = dithering on, the faithful
+     * default; 1 = force it off everywhere) so a zero-initialized host that
+     * predates this field keeps exactly today's faithful behavior â€” the
+     * same "0 = no opinion, use the default" convention as vsync/fmv_filter
+     * above, needed here because plain 0/1-as-the-value would make an unset
+     * field silently mean "force off". Appended for ABI stability. */
+    int  dither_force_off;
 };
 
 /* Values for RecompLauncherCSettings.vsync (1-based; 0 = unset). */
@@ -1101,6 +1110,11 @@ typedef struct RecompLauncherCGameInfo {
      * withdrawn from the UI while staying readable from game.toml/settings.toml
      * (psxrecomp ENHANCEMENTS.md G1.8/G1.9). Appended for ABI stability. */
     int  has_geometry_precision;
+
+    /* Master dithering on/off row (Settings.dither_force_off). 0 => no row
+     * drawn, so a host that leaves this unset keeps today's settings surface
+     * unchanged. Appended for ABI stability. */
+    int  has_dithering;
 
     /* Local rewind buffer size control (Settings.rewind_depth). PSX only. */
     int  has_rewind_depth;

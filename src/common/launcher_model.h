@@ -352,6 +352,8 @@ typedef struct {
     // One flag gates both rows (two halves of one enhancement); the settings
     // stay independent. false => both rows hidden.
     bool     has_geometry_precision;
+    // Master dithering on/off row (see GameInfo.has_dithering).
+    bool     has_dithering;
     // (no has_fullscreen_toggle: the Fullscreen row is universal — every
     // console draws it; the ABI flag of that name is deprecated/ignored.)
     bool     has_bios;
@@ -620,6 +622,8 @@ void launcher_model_clear_shader_path(LauncherModel* m);
 // PSX geometry precision (gated on has_geometry_precision).
 void launcher_model_toggle_geometry_correction(LauncherModel* m);
 void launcher_model_toggle_perspective_texturing(LauncherModel* m);
+// Master dithering on/off (gated on has_dithering).
+void launcher_model_toggle_dithering(LauncherModel* m);
 // True when geometry correction is on but supersampling is 1x, where the
 // correction rounds back to the native pixel and has no visible effect.
 bool launcher_model_geometry_correction_inert(const LauncherModel* m);
