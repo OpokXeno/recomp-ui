@@ -39,6 +39,14 @@ typedef struct LauncherPlatform {
     // font raster sizes and any physical dimensions by this.
     float display_scale;
 
+    // SDL window coordinates per logical unit. 1.0 where SDL reports the
+    // density through the pixel size (macOS retina, Wayland under
+    // HIGH_PIXEL_DENSITY): the window size IS the logical size there. On
+    // Windows and X11 window coordinates ARE pixels, so logical_w/h above is
+    // synthesized as pixels/display_scale and this carries the factor that
+    // mouse input — which always arrives in window coordinates — needs.
+    float input_scale;
+
     bool  scale_changed;   // set for one frame after a DPI/monitor change
     bool  size_changed;    // set for one frame after a resize
     bool  should_quit;     // window close requested
@@ -48,6 +56,18 @@ typedef struct LauncherPlatform {
 // Returns false if SDL/GL initialization fails (caller boots as if skipped).
 bool launcher_platform_open(LauncherPlatform* p, const char* title,
                             int logical_w, int logical_h);
+
+// Apply an image file as the window / taskbar icon. The launcher and the game
+// it boots are one product to the player, so the launcher must not sit in the
+// task switcher under the toolkit's default placeholder while the game beside
+// it carries the real art. The HOST supplies the path — the same file its own
+// runtime applies — because the icon's name and location are the host's
+// convention, not something a console-neutral launcher should guess.
+//
+// No-op for a NULL/empty path or an image that fails to decode: an icon is
+// decoration, never a reason to fail opening the launcher. Safe to call any
+// time after launcher_platform_open() returns true.
+void launcher_platform_set_icon(LauncherPlatform* p, const char* image_path);
 
 // Refresh logical/pixel sizes and display scale from the live window. Called
 // once per frame (and after resize / scale-change events).

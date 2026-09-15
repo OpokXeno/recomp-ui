@@ -4,8 +4,9 @@
 //   * player buttons  -> keybinds.ini  (SDL *scancode* names), via keybinds.c
 //     -- EXCEPT the PSX SystemProfile, which persists through psxrecomp's own
 //        24-button psx_keybinds.c format instead (see the PSX-native bridge
-//        below launcher_binds_load's declaration) so PSX rebinds actually
-//        reach the game. SNES (and every stub profile) is unaffected.
+//        below launcher_binds_load's declaration) so PSX rebinds actually reach
+//        the game. SNES keyboard binds still use keybinds.c, while SNES gamepad
+//        binds persist through config.ini [GamepadMap].
 //   * system hotkeys   -> config.ini [KeyMap] (SDL *keycode* names), surgical edit
 //
 // This is the module that makes remaps actually STICK. Kept separate from the
@@ -39,20 +40,18 @@ void launcher_binds_set_button(LauncherModel* m, int player, int b, int scancode
 
 // N64-native store only: bind an arbitrary FIELD (type/id per
 // consoles/n64/n64_binds.h — key, pad button, signed pad axis, raw joystick
-// button/axis) into alternate slot 0/1 of the device table the player's
-// current input source selects. No-op for every other profile.
+// button/axis) into alternate slot 0/1 of a device table. A KEY always lands
+// in the keyboard table; controller fields reach this store only as the
+// input.cfg mirror of a per-GUID pad bind. No-op for every other profile.
 void launcher_binds_set_field(LauncherModel* m, int player, int b, int slot,
                               int type, int id);
 
 // Re-read every player's bind display strings from the active store. Cheap;
-// the backend calls it when a Configure page's input source changes (the N64
-// store is per-device-TYPE, so the shown table follows the source).
+// the backend calls it on entry to a Configure page and whenever the input
+// source or the selected controller changes — both can change what the stores
+// answer (N64's keyboard table is shared across ports; a per-GUID gamepad
+// store answers differently for every pad).
 void launcher_binds_refresh(LauncherModel* m);
-
-// Whether a capture for `player` (1-based) should listen for GAMEPAD events
-// (pad buttons / axis throws / raw joystick fields) instead of the keyboard —
-// true only for the N64 store when that player's source is a gamepad.
-int launcher_binds_wants_pad_capture(const LauncherModel* m, int player);
 
 // Generic GAMEPAD-bind kind codes for launcher_binds_set_pad_button()'s `kind`
 // argument. Values mirror the engine's GamepadBindKind exactly (and equal the
@@ -63,8 +62,9 @@ int launcher_binds_wants_pad_capture(const LauncherModel* m, int player);
 #define LNG_PADBIND_BUTTON 1   // `code` = SDL_GameControllerButton
 #define LNG_PADBIND_AXIS   2   // `code` = SDL_GameControllerAxis, `axis_dir` = +1/-1
 
-// A player button's GAMEPAD bind was captured (Genesis has_pad_binds, or PSX
-// Gamepad Bindings panel keyed by the player's selected gamepad GUID).
+// A player button's GAMEPAD bind was captured (SNES [GamepadMap], Genesis
+// has_pad_binds, or PSX Gamepad Bindings panel keyed by the player's selected
+// gamepad GUID).
 // kind/code/axis_dir use the LNG_PADBIND_* encoding above. Persists through
 // the console's native bridge and refreshes the model's pad_binds display
 // string. No-op on consoles without a pad-bind store.
@@ -75,10 +75,41 @@ void launcher_binds_set_pad_button(LauncherModel* m, int player, int b,
 // (N64: resets the whole device TABLE the player's source selects.)
 void launcher_binds_reset_player(LauncherModel* m, int player);
 
+// ---- N64 gamepad profiles (input.ini, per GUID) ----------------------------
+// Same three actions PSX and SNES offer, on the per-GUID store n64lle's host
+// reads. Every pad capture already writes the section; Save commits the
+// name, custom-name flag and deadzone with it. Rename marks the name custom
+// so a reconnect does not overwrite it with the driver's. Delete empties the
+// section and releases every player slot that pointed at the GUID.
+void launcher_binds_save_n64_gamepad(LauncherModel* m, int player /*1-based*/);
+void launcher_binds_rename_n64_gamepad(LauncherModel* m, int player /*1-based*/,
+                                       const char* name);
+void launcher_binds_delete_n64_gamepad(LauncherModel* m, int player /*1-based*/);
+
+// ---- SNES gamepad profiles (config.ini [Controller.<guid>]) ---------------
+// Per-device layout, name and deadzone kept in the game's own config.ini, so
+// two controllers can hold different mappings instead of sharing the single
+// [GamepadMap] line the game reads. Save writes the CURRENT mapping; apply
+// copies a saved one back onto [GamepadMap]; delete empties the section.
+int  launcher_binds_snes_profile_exists(LauncherModel* m, int player /*1-based*/);
+void launcher_binds_save_snes_gamepad(LauncherModel* m, int player /*1-based*/);
+void launcher_binds_rename_snes_gamepad(LauncherModel* m, int player /*1-based*/,
+                                        const char* name);
+void launcher_binds_delete_snes_gamepad(LauncherModel* m, int player /*1-based*/);
+void launcher_binds_apply_snes_pad_profile(LauncherModel* m, int player /*1-based*/);
+// Give a slot restored from settings a readable label (saved profile Name, or
+// the live device). Without it the Input source box shows the raw GUID.
+void launcher_binds_hydrate_snes_pad_names(LauncherModel* m,
+                                           const LauncherPad* pads,
+                                           int pad_count);
+
 // ---- PSX gamepad registry (input.ini [gamepads] + [mapping.<guid>]) --------
 // Save Profile: persist this player's selected gamepad name, custom-name flag,
 // deadzone, and button mappings into input.ini.
 void launcher_binds_save_psx_gamepad(LauncherModel* m, int player /*1-based*/);
+// Save Profile with a KEYBOARD input source: flush this player's keyboard map
+// to keybinds.ini (captures already persist; this is the explicit commit).
+void launcher_binds_save_psx_keyboard(LauncherModel* m, int player /*1-based*/);
 // Rename the selected gamepad (custom display name for the GUID).
 void launcher_binds_rename_psx_gamepad(LauncherModel* m, int player /*1-based*/,
                                        const char* name);

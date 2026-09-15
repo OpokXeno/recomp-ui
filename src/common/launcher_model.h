@@ -45,6 +45,24 @@ typedef enum {
     LNG_VIEW_MODS,
     LNG_VIEW_ASSIST_TOOLS,
     LNG_VIEW_CREDITS,
+    /* The netplay room, full screen. Entered and left by SEAT STATE, not by
+     * a button: the frame switches here whenever the backend reports the
+     * local player seated in a lobby, and back to Netplay when it does not.
+     * Every profile that opens a lobby goes through it. */
+    LNG_VIEW_LOBBY,
+    /* The fork the NETPLAY button lands on: LAN / Direct IP, or online. Its
+     * own view rather than a modal because the choice decides what the whole
+     * netplay page then means, and because a controller has to be able to
+     * make it. */
+    LNG_VIEW_NETPLAY_MODE,
+    /* Signing in, full screen. Only reached on the way to ONLINE play, and
+     * skipped entirely when this client is already signed in or when the
+     * server offers no logins -- see draw_netplay_mode_page. */
+    LNG_VIEW_NETPLAY_SIGNIN,
+    /* Keep last. launcher_model_set_view validates against this rather than
+     * against the last real view, which is what silently swallowed the two
+     * views above when they were first added. */
+    LNG_VIEW__COUNT,
 } LngView;
 
 typedef enum {
@@ -76,6 +94,13 @@ typedef enum {
 // DualShock inputs + 8 keyboard->analog-stick direction binds); this leaves
 // headroom for future systems without another struct-layout change.
 #define LNG_MAX_BUTTONS 24
+
+// Upper bound on a multi-image title's disc roster (GameInfo.num_discs).
+// The largest shipped PS1 sets are 4 discs (Final Fantasy IX, Xenogears is
+// 2); 8 leaves headroom without making the model struct meaningfully bigger.
+// A host that publishes more discs than this has its roster clamped, and the
+// discs past the cap simply do not appear in the dropdown.
+#define LNG_MAX_DISCS 8
 
 // Upper bound on a SystemProfile's ControllerSpec.max_players — sizes the
 // per-player state below. Mirrors RECOMP_LAUNCHER_MAX_PLAYERS (the ABI
@@ -125,6 +150,7 @@ typedef struct {
     int  netplay_ok;    // 1 = OK for online; 0 = TOC/cue policy failed
     char disc_fp[65];   // TOC fingerprint for lobby peer matching
     char netplay_detail[160];
+    int sbi_status; // RECOMP_SBI_* for the selected disc; zero for legacy hosts.
 } VerifyResult;
 
 typedef struct {
@@ -170,10 +196,10 @@ typedef struct {
 
     // ---- PSX memory-card block usage (SAVE_MEMCARD; see launcher_system.h) ----
     // Per-slot bitmask over the 15 PS1 card blocks (bit i = block i occupied).
-    // Populated by a SystemProfile's SaveSpec.probe hook (SaveProbeFn) once a
-    // host wires one up; left zeroed/unused while probe is NULL (every profile
-    // today), in which case the Save panel renders a representative placeholder
-    // grid instead of reading this field.
+    // Populated by the host memcard_inspect callback (lm_inspect_memcard) or a
+    // SystemProfile's SaveSpec.probe hook (SaveProbeFn). Read through
+    // launcher_model_memcard_blocks_used(), which decides when this field is
+    // authoritative and when the panel shows blank / a proto placeholder.
     uint16_t    memcard_blocks_used[2];
     // Set true by launcher_model_new_memcard() right after it formats+adopts
     // a blank card for that slot, cleared as soon as the slot's path changes
@@ -189,10 +215,16 @@ typedef struct {
     // When non-NULL these drive the REAL disc verdict + memcard block usage
     // (re-run on every disc/card change) instead of the placeholder synthesis.
     int (*disc_verify_cb)(const char* disc_path, RecompLauncherCDiscVerify* out);
+    int (*import_sbi_cb)(const char*, const char*, char*, size_t, char*, size_t);
     int (*memcard_inspect_cb)(const char* card_path, RecompLauncherCMemcard* out);
     int (*bios_verify_cb)(const char* bios_path, RecompLauncherCBiosVerify* out);
     /* Optional host flush for first-run picks (project-root bios.cfg / disc.cfg). */
     int (*persist_setup_cb)(void* ctx, const char* rom_path, const char* bios_path);
+    /* Multi-disc flush. Used INSTEAD of persist_setup_cb when non-NULL and the
+     * title has a roster (num_discs > 1), so every located image is written,
+     * not just the selected one. See RecompLauncherCGameInfo.persist_setup_discs. */
+    int (*persist_setup_discs_cb)(void* ctx, const char* const* disc_paths,
+                                  int disc_count, const char* bios_path);
     void*       persist_setup_ctx;
     int (*prepare_disc_cb)(const char* source_path, char* out_disc_path, size_t out_cap,
                            char* err_msg, size_t err_cap);
@@ -278,6 +310,8 @@ typedef struct {
     bool has_gyro_controls;
     bool has_sharp_filter;
     bool has_affine_filter;
+    bool has_frame_blend;
+    bool has_run_ahead;
     bool has_shader;
     bool netplay_supported;
     /* Host opted into first-run wizard + Generate & rebuild (GameInfo). */
@@ -289,6 +323,13 @@ typedef struct {
     bool      mod_show_packages;
     char      mod_search[96];
     char      mod_status[256];
+    bool      rom_patch_supported;
+    const char* rom_patch_note;
+    const char* rom_patch_cache_dir;
+    const char* rom_patch_required_sha1;
+    char      rom_patch_status[256];
+    char      rom_patch_prepared_path[512];
+    char      rom_patch_prepared_sha1[41];
     // Game-supplied aspect vocabulary (GameInfo.aspect_labels): when set,
     // the aspect cycle walks these 0..num_aspect_labels-1 instead of the
     // built-in 4:3/16:9/21:9 mask set; aspect_experimental tags the row.
@@ -302,10 +343,19 @@ typedef struct {
     int  num_display_layouts;
     bool has_assist_tools;
     const char* assist_tools_note;
+    bool has_virtual_stylus;
     bool settings_bindings;
     const char* const* assist_binding_labels;
     int assist_binding_count;
     const char* credits_text;
+    int assist_fast_forward_min;
+    int assist_fast_forward_max;
+    /* Resolved defaults for the assist bindings, seeded from
+     * GameInfo.assist_default_{key,pad}_bind when the host supplies them and
+     * from the incoming settings otherwise. The Controller page's reset
+     * affordance restores these rather than zeroing a binding. */
+    int default_assist_key_bind[RECOMP_LAUNCHER_MAX_ASSIST_BINDINGS];
+    int default_assist_pad_bind[RECOMP_LAUNCHER_MAX_ASSIST_BINDINGS];
     // Number of players the GAME actually supports. Mega Man X is 1-player, so
     // the launcher must not show a dead Player 2 row. Games that support 2
     // report 2 and the second row appears. Driven by data, never hardcoded.
@@ -377,6 +427,7 @@ typedef struct {
 
     bool     rom_present;
     char     rom_full[512];          // absolute path (what we hand to the game)
+    char     rom_sha1_hex[41];       // complete stock-image identity
     char     rom_file[128];          // basename for display, e.g. "mmx.sfc"
     char     rom_size[48];           // "1.50 MB"
     char     rom_header[24];         // "LoROM"
@@ -385,6 +436,27 @@ typedef struct {
     bool     crc_match;
     bool     sha_match;      // any known_sha256 matched
     bool     sha1_match;     // any known_sha1_hex matched
+
+    // ---- multi-image disc roster (GameInfo.discs) ----
+    // Borrowed build roster: which discs this game was compiled against.
+    // num_discs <= 1 means a single-image title and none of the disc-selection
+    // UI composes. disc_selected is a 0-based index into discs[]; it tracks
+    // rom_full, so a browse-in rebinds the SELECTED slot rather than silently
+    // becoming "the disc" for a set the build still expects N images of.
+    const RecompLauncherCDisc* discs;
+    int      num_discs;
+    int      disc_selected;
+    // Session-only per-slot browse-in. The roster path is what the build was
+    // made against; when a player points slot i somewhere else this run, that
+    // path lives here and shadows discs[i].path. Only the SELECTED slot's
+    // path is persisted (settings disc path + disc_index), so an override on
+    // an unselected slot is deliberately not remembered across runs.
+    char     disc_path_override[LNG_MAX_DISCS][512];
+    // Formatted "Disc N" fallback text for a host that supplied no label.
+    // One slot per disc rather than one shared buffer, so a caller may hold
+    // two rows' labels at once (the combo does: preview plus the row it is
+    // drawing) without the second overwriting the first.
+    char     disc_label_scratch[LNG_MAX_DISCS][32];
 
     // ---- disc-verdict result (verify.mode==1 systems only; PSX today) ----
     // See VerifyResult above. Untouched (all-zero) for verify.mode==0 systems
@@ -437,10 +509,32 @@ typedef struct {
     char      setup_error[256];
     bool      netplay_name_modal_open;
     bool      netplay_name_prompted;
+    /* Why the last name was refused, shown inside the Player Name modal and
+     * cleared as soon as the player edits the field. Set by the local check
+     * (np->name_rejected) or by the server's `name_rejected` error. */
+    char      netplay_name_error[128];
+    /* The same, for the room title in the Host Lobby modal: a lobby name sits
+     * in the browser in front of everyone shopping for a game, so it is
+     * refused like a player name rather than masked. */
+    char      netplay_host_name_error[128];
     bool      netplay_host_modal_open;
     bool      netplay_network_modal_open;
     bool      netplay_password_modal_open;
+    bool      netplay_moderation_modal_open;
+    /* The report dialog: which line, who said it, and what the reporter
+     * chose. The mid is the whole referent -- the text is never carried. */
+    bool      netplay_report_modal_open;
+    char      netplay_report_mid[40];
+    char      netplay_report_who[64];
+    int       netplay_report_reason;
+    char      netplay_report_note[512];
+    char      netplay_report_status[160];
     bool      netplay_local_room;
+    /* Which kind of netplay the player picked on LNG_VIEW_NETPLAY_MODE.
+     * 0 = not chosen yet, 1 = LAN / Direct IP, 2 = online. The netplay page
+     * reads it to decide whether the lobby-server half of itself is drawn at
+     * all: a LAN player should not be looking at an online lobby list. */
+    int       netplay_mode;
     int       netplay_selected_lobby;
     char      netplay_name_edit[64];
     char      netplay_lobby_url[256];
@@ -456,11 +550,21 @@ typedef struct {
     bool      netplay_lan_only;   /* "LAN/Direct IP Only"; false = online / ICE path */
     bool      netplay_list_fresh; /* false → refresh lobby list on next Netplay draw */
     bool      netplay_direct_modal_open;
+    /* Automatch. The accept gate is NOT a flag the UI owns -- it opens and
+     * closes off automatch_state, so a peer's decline or a lapsed deadline
+     * takes the modal down without the launcher having to be told twice.
+     * This only tracks whether the popup has been opened for the current
+     * gate, so ImGui::OpenPopup is called once rather than every frame. */
+    bool      netplay_automatch_gate_open;
+    /* The queue-type picker, drawn only when the server offers more than one. */
+    bool      netplay_automatch_picker_open;
     char      netplay_direct_ip[64];
     char      netplay_direct_port[16];
     char      netplay_password[64];
     char      netplay_status[160];
     bool      netplay_lobby_settings_open;
+    /* Host-authoritative mod picker for the open lobby (compact mods page). */
+    bool      netplay_lobby_mods_open;
     int       netplay_lobby_input_delay; /* UI cache; engine clamps 2..20 */
     /* When false (default), host picks delay from max peer RTT at match start.
      * When true, netplay_lobby_input_delay is used as-is. */
@@ -481,6 +585,15 @@ typedef struct {
     int       netplay_host_max_players;
     /* Active room seat ceiling after create/join (0 = use game player_count). */
     int       netplay_lobby_max_slots;
+    /* Lobby chat: the line being typed, and the seq of the newest line the
+     * chat panel has scrolled to (so a new line scrolls the list once). */
+    char      netplay_chat_edit[256];
+    uint32_t  netplay_chat_seen_seq;
+    bool      netplay_chat_focus; /* refocus the input after Enter sends */
+    /* Server chat (per-game, on the lobby browser page): same three. */
+    char      netplay_schat_edit[256];
+    uint32_t  netplay_schat_seen_seq;
+    bool      netplay_schat_focus;
     bool      defaults_modal_open;   // confirmed full-settings reset
 
     // Selected gamepad per player (when player_src == 2). pad_id is the live
@@ -540,8 +653,64 @@ void launcher_model_commit(const LauncherModel* m, RecompLauncherCSettings* io);
 // displayed file name / verification state.
 void launcher_model_set_rom(LauncherModel* m, const char* path);
 
+// ---- multi-image disc roster (GameInfo.discs) ----------------------------
+// Number of discs this build was made from. 0 or 1 => single-image title:
+// the Disc Selection dropdown does not compose and the browse button carries
+// no disc number.
+int  launcher_model_disc_count(const LauncherModel* m);
+// 0-based index of the selected roster slot, or -1 when there is no roster.
+int  launcher_model_disc_selected(const LauncherModel* m);
+// Disc number as printed on the media for slot `idx` (1-based). 0 when idx is
+// out of range.
+int  launcher_model_disc_number(const LauncherModel* m, int idx);
+// Dropdown row text for slot `idx` — the host's label when it gave one, else
+// "Disc <number>". Never NULL; "" when idx is out of range.
+const char* launcher_model_disc_label(const LauncherModel* m, int idx);
+// Effective image path for slot `idx`: this run's browse-in when the player
+// made one, otherwise the path the build was made against. "" out of range.
+const char* launcher_model_disc_path(const LauncherModel* m, int idx);
+// Select a disc: rebinds the ROM path (re-running verification against the
+// new image) and records the choice in settings so it persists. Out-of-range
+// indices are ignored; re-selecting the current disc is a no-op.
+void launcher_model_select_disc(LauncherModel* m, int idx);
+
+// ---- per-slot disc paths (setup wizard) ---------------------------------
+// Bind one slot's image without changing which disc is selected. This is what
+// the wizard's per-disc rows call: a player locating disc 3 is telling us
+// where disc 3 lives, not asking to boot it. Binding the SELECTED slot also
+// rebinds the ROM (and so re-runs verification), because for that slot the two
+// are the same fact. An empty/NULL path clears the slot.
+void launcher_model_set_disc_path(LauncherModel* m, int idx, const char* path);
+// File NAME (no directory) the project was BUILT from for this slot, or "" when
+// the host published no path. The developer's absolute path is meaningless on a
+// player's machine, but the file name is exactly what they are looking for, so
+// the wizard shows it as the hint for an unlocated disc.
+const char* launcher_model_disc_suggested_name(const LauncherModel* m, int idx);
+// True when slot idx has a path that exists on disk.
+bool launcher_model_disc_ready(const LauncherModel* m, int idx);
+// How many slots are ready — the "N of M selected" counter.
+int  launcher_model_discs_ready_count(const LauncherModel* m);
+// Fill unset slots by pattern-matching siblings of an already-located disc
+// (".../Foo (Disc 1).cue" -> ".../Foo (Disc 2).cue", including the parent
+// directory when the set is stored one folder per disc). Only writes slots
+// that are currently empty, and only when the candidate exists. Returns how
+// many slots were newly filled.
+int  launcher_model_autofill_sibling_discs(LauncherModel* m);
+
 // Full path of the currently selected ROM ("" when none).
 const char* launcher_model_rom_path(const LauncherModel* m);
+
+// Effective path returned to the host after a patch was prepared; otherwise
+// the selected stock-ROM path.
+const char* launcher_model_effective_rom_path(const LauncherModel* m);
+
+// Patch selection and launch preparation. Selecting a patch enables it;
+// clearing disables it. Preparation verifies the stock image, applies the
+// patch into the host-provided cache, and records the effective SHA-1.
+void launcher_model_set_rom_patch(LauncherModel* m, const char* path);
+void launcher_model_clear_rom_patch(LauncherModel* m);
+void launcher_model_toggle_rom_patch(LauncherModel* m);
+bool launcher_model_prepare_rom_patch(LauncherModel* m);
 
 // True iff a ROM is loaded and every fingerprint the game provides (CRC and/or
 // SHA-256) matches. If the game provides no fingerprint at all, returns false
@@ -561,11 +730,23 @@ void launcher_model_restore_defaults(LauncherModel* m);
 void launcher_model_cancel_restore_defaults(LauncherModel* m);
 
 // ---- display settings ----
-void launcher_model_cycle_scale(LauncherModel* m);   // 1..6 wrap
+// Window scale, in whole native-size steps. LNG_WINDOW_SCALE_MAX bounds both
+// the cycle's wrap and the dropdown's list, so the two can never offer
+// different sets.
+#define LNG_WINDOW_SCALE_MAX 6
+void launcher_model_cycle_scale(LauncherModel* m);   // 1..LNG_WINDOW_SCALE_MAX wrap
+void launcher_model_set_scale(LauncherModel* m, int scale);  // clamped
 void launcher_model_toggle_filter(LauncherModel* m);
 void launcher_model_cycle_scaling_filter(LauncherModel* m);
 const char* launcher_model_scaling_filter_label(const LauncherModel* m);
 void launcher_model_toggle_affine_filter(LauncherModel* m);
+void launcher_model_toggle_frame_blend(LauncherModel* m);  // gated has_frame_blend
+// Run-ahead depth, 0 (Off) .. RECOMP_LAUNCHER_RUN_AHEAD_MAX. Off by default:
+// each frame of depth is a whole extra emulated frame plus a snapshot/restore,
+// so it is opt-in rather than a cost every host pays. Set, not cycled -- the
+// UI draws it as a dropdown, and the labels for each depth live with that
+// control alongside every other choice list.
+void launcher_model_set_run_ahead(LauncherModel* m, int frames);  // clamped, gated has_run_ahead
 void launcher_model_toggle_widescreen(LauncherModel* m);  // gated
 void launcher_model_toggle_adaptive_view(LauncherModel* m);  // gated; fixed aspect is retained
 /* Unified Native / fixed widescreen / Adaptive control. Compatibility fields
@@ -608,6 +789,12 @@ void launcher_model_cycle_window_size(LauncherModel* m);       // {960,1280,1600
 const char* launcher_model_window_size_label(const LauncherModel* m);  // "1280 x 960" (H follows aspect)
 void launcher_model_toggle_renderer(LauncherModel* m);         // Software/OpenGL
 const char* launcher_model_renderer_label(const LauncherModel* m);
+/* List form of the same vocabulary, for hosts that draw a dropdown instead of
+ * a cycle button. count/label_at follow the same precedence as the label
+ * getter above; set_renderer clamps. */
+int         launcher_model_renderer_count(const LauncherModel* m);
+const char* launcher_model_renderer_label_at(const LauncherModel* m, int i);
+void        launcher_model_set_renderer(LauncherModel* m, int index);
 void launcher_model_cycle_supersampling(LauncherModel* m);     // 1x..8x wrap
 const char* launcher_model_supersampling_label(const LauncherModel* m);
 void launcher_model_cycle_aa(LauncherModel* m);            // Off/2x/4x/8x (MSAA sample count)
@@ -632,6 +819,9 @@ const char* launcher_model_screen_kind_label(const LauncherModel* m);
 void launcher_model_cycle_fps(LauncherModel* m);                // {30,60} wrap
 const char* launcher_model_fps_label(const LauncherModel* m);   // "30 FPS"/"60 FPS"
 void launcher_model_toggle_spu_hq(LauncherModel* m);
+// Local rewind on/off. Off by default: the ring holds whole-machine snapshots
+// on a frame cadence, so it is opt-in rather than a cost every host pays.
+void launcher_model_toggle_rewind_enabled(LauncherModel* m);
 void launcher_model_cycle_rewind_depth(LauncherModel* m);
 const char* launcher_model_rewind_depth_label(const LauncherModel* m);
 void launcher_model_cycle_rewind_interval(LauncherModel* m);
@@ -639,11 +829,17 @@ const char* launcher_model_rewind_interval_label(const LauncherModel* m);
 // Driver vsync at present time (gated on has_vsync): On -> Off -> Adaptive,
 // wraps. Stored in Settings.vsync as RECOMP_LAUNCHER_VSYNC_*.
 void launcher_model_cycle_vsync(LauncherModel* m);
-const char* launcher_model_vsync_label(const LauncherModel* m);  // "On"/"Off"/"Adaptive"
+// Binary On/Off flip for the legacy-surface checkbox (Adaptive counts as On).
+void launcher_model_toggle_vsync(LauncherModel* m);
+const char* launcher_model_vsync_label(const LauncherModel* m);
+/* Set the exact state rather than cycling to it. Takes a
+ * RECOMP_LAUNCHER_VSYNC_* value, not an index. */
+void launcher_model_set_vsync(LauncherModel* m, int value);  // "On"/"Off"/"Adaptive"
 void launcher_model_toggle_skip_fmv(LauncherModel* m);
 void launcher_model_toggle_turbo_loads(LauncherModel* m);
 void launcher_model_cycle_fullscreen(LauncherModel* m);        // Off -> Borderless -> Exclusive, wraps
 const char* launcher_model_fullscreen_label(const LauncherModel* m);  // "Off"/"Borderless"/"Exclusive"
+void launcher_model_set_fullscreen(LauncherModel* m, int mode);  // 0/1/2, clamped
 void launcher_model_toggle_fullscreen(LauncherModel* m);       // binary on/off; kept for bool-style hosts
 void launcher_model_cycle_language(LauncherModel* m);          // wraps over num_languages
 const char* launcher_model_language_label(const LauncherModel* m);
@@ -673,6 +869,10 @@ void launcher_model_clear_sram(LauncherModel* m);
 
 // ---- PSX memory-card slots (SAVE_MEMCARD only; no-op guarded by slot range) ----
 void launcher_model_set_memcard_path(LauncherModel* m, int slot, const char* path);
+// Block bitmask (bit i = block i occupied) the Save panel paints for one slot:
+// real inspect result, else blank for a freshly formatted card or for any slot
+// on a host that inspects real cards, else the SaveProbeFn / placeholder path.
+uint16_t launcher_model_memcard_blocks_used(const LauncherModel* m, int slot);
 // Enable/disable one card slot (mirrors the legacy launcher's per-card switch;
 // a disabled slot's SIO port reports no card present to the host once wired).
 void launcher_model_toggle_memcard(LauncherModel* m, int slot);
@@ -694,6 +894,9 @@ int  launcher_model_visible_player_count(const LauncherModel* m);
 int  launcher_model_multitap_analog_available(const LauncherModel* m);
 int  launcher_model_multitap_analog_enabled(const LauncherModel* m);
 void launcher_model_toggle_multitap_analog(LauncherModel* m);
+int  launcher_model_virtual_stylus_available(const LauncherModel* m);
+int  launcher_model_virtual_stylus_enabled(const LauncherModel* m);
+void launcher_model_toggle_virtual_stylus(LauncherModel* m);
 
 // ---- N64 Transfer Pak slots (tpak_slots only; no-op guarded by slot range) ----
 // Adopt a GB cartridge ROM for one port's Transfer Pak. Re-runs the host's
@@ -762,6 +965,10 @@ void launcher_model_skip_msu1_patch(LauncherModel* m);
 void launcher_model_set_pad_mode(LauncherModel* m, int player, int mode);
 void launcher_model_cycle_player_src(LauncherModel* m, int player); // None/Kbd/Pad
 void launcher_model_deadzone_delta(LauncherModel* m, int player, int delta);
+/* Absolute set, for a drag slider rather than a +/- stepper. Clamped 0..100,
+ * and to whole percent: the value the runner consumes is a raw stick radius
+ * derived from it, so a fractional percent would not survive the round trip. */
+void launcher_model_set_deadzone(LauncherModel* m, int player, int pct);
 // Set the input source explicitly (used by the device dropdown). kind: 0 None,
 // 1 Keyboard, 2 Gamepad. For gamepad, pass the SDL id + display name + GUID
 // (GUID may be NULL/empty; then player_gamepad_guid[player] is cleared).
@@ -793,6 +1000,17 @@ void launcher_model_set_gyro_sensitivity(LauncherModel* m, float value);
 // because generated sources / a full build are already present. Cleared
 // disc.cfg / BIOS paths reopen the wizard without the Generate & rebuild page.
 bool launcher_model_setup_media_confirm_only(const LauncherModel* m);
+// True when the BIOS the player picked inside the wizard is a valid retail dump
+// with no backend linked in this binary — the wizard keeps its disc rows and
+// swaps its primary button (Confirm / Continue) for Generate & rebuild.
+bool launcher_model_setup_needs_bios_regen(const LauncherModel* m);
+// Why that Generate & rebuild cannot run yet (tooltip text), or NULL when it
+// can. NULL also when no BIOS regen is pending at all.
+const char* launcher_model_setup_bios_regen_blocker(const LauncherModel* m);
+bool launcher_model_can_start_bios_regen(const LauncherModel* m);
+// Kick generate (+ chained rebuild) for the staged BIOS from inside the wizard.
+// No-op unless launcher_model_can_start_bios_regen.
+void launcher_model_setup_start_bios_regen(LauncherModel* m);
 // True when required BIOS + ROM/disc paths are present (readable), and when
 // prepare_required_before_continue is set, prepare (+ chained rebuild) has
 // succeeded. Fingerprint mismatch is allowed here.

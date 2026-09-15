@@ -43,6 +43,10 @@ void rui_psx_binds_set(const char* path, int player, int b, int scancode);
 int  rui_psx_binds_get_slot(const char* path, int player, int b, int slot);
 void rui_psx_binds_set_slot(const char* path, int player, int b, int slot, int scancode);
 
+// Flush the whole in-memory keyboard map to `path`. Rebinds already persist
+// on capture; this is the explicit Save Profile action of the keyboard panel.
+void rui_psx_binds_save(const char* path);
+
 // Reset one player to the shared default keyboard map + persist.
 void rui_psx_binds_reset(const char* path, int player);
 

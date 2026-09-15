@@ -27,6 +27,18 @@ static const ButtonDef kSnesPadButtons[] = {
 };
 #define LNG_SNES_PAD_BUTTON_COUNT ((int)(sizeof(kSnesPadButtons) / sizeof(kSnesPadButtons[0])))
 
+// ---- Gamepad Bindings panel order (column-major: down, then next column) ----
+// Indices into kSnesPadButtons. Twelve buttons divide exactly into the three
+// groups a SNES pad physically has:
+//   Col1: D-pad        Col2: face        Col3: shoulders + Start/Select
+static const int kSnesGamepadBindOrder[LNG_SNES_PAD_BUTTON_COUNT] = {
+    0, 1, 2, 3,      // Up Down Left Right
+    4, 5, 6, 7,      // A B X Y
+    8, 9, 10, 11,    // L R Start Select
+};
+#define LNG_SNES_GAMEPAD_BIND_COLS 3
+#define LNG_SNES_GAMEPAD_BIND_ROWS 4
+
 // ---- panel composition --------------------------------------------------------
 static const char* const kPanelsSettingsSnes[]  = { "video", "audio", "hotkeys", NULL };
 
@@ -45,6 +57,11 @@ static const SystemProfile kSystemProfileSnes = {
         kSnesPadButtons, LNG_SNES_PAD_BUTTON_COUNT,
         "pad.tga", NULL, NULL,
         /* max_players */ 2, /* has_pad_mode */ 0,
+        /* binds_per_input */ 1, /* modes */ NULL, /* mode_count */ 0,
+        /* has_pad_binds */ 1,
+        /* pad_bind_order */ kSnesGamepadBindOrder,
+        /* pad_bind_cols  */ LNG_SNES_GAMEPAD_BIND_COLS,
+        /* pad_bind_rows  */ LNG_SNES_GAMEPAD_BIND_ROWS,
     },
     /* save */    { SAVE_SRAM, 1, NULL },
     /* video */   {
@@ -54,7 +71,27 @@ static const SystemProfile kSystemProfileSnes = {
         /*bios*/0, /*deadzone*/0,
     },
     /* verify */  { 0, NULL },
-    /* hotkeys_mask */ LNG_HOTKEYS_ALL,
+    /* hotkeys_mask */ (uint32_t)(LNG_HOTKEYS_ALL |
+                                   /* Save-state slot browser: the SNES runner
+                                    * has had snes_savestate_menu.c for a while,
+                                    * but the bind was unreachable here because
+                                    * LNG_HOTKEYS_ALL stops at bit 10 and this
+                                    * one is bit 15 — ports hardcoded a key
+                                    * instead. Note the framework leaves it
+                                    * UNBOUND by default (F1..F10 are the ten
+                                    * LoadState slots on SNES), so this row
+                                    * shows "(unbound)" until a player picks a
+                                    * key or a port's config.ini names one. */
+                                   (1u << LNG_HK_SAVE_STATE_MENU) |
+                                   /* Rewind: added now that snes_rewind.c
+                                    * exists behind it. It was deliberately
+                                    * withheld while there was nothing to
+                                    * bind, on the same principle as
+                                    * n64_profile.h's debug-tools note -- a
+                                    * control that does nothing is worse than
+                                    * an absent one. Unbound by default here
+                                    * too: F8 is LoadState slot 8. */
+                                   (1u << LNG_HK_REWIND)),
     /* panels_dashboard  */ kPanelsDashboardCommon,
     /* panels_settings   */ kPanelsSettingsSnes,
     /* panels_controller */ kPanelsControllerCommon,

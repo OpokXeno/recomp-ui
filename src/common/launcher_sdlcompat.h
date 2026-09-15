@@ -30,6 +30,12 @@
 #define SDL_EVENT_MOUSE_BUTTON_DOWN     SDL_MOUSEBUTTONDOWN
 #define SDL_EVENT_MOUSE_BUTTON_UP       SDL_MOUSEBUTTONUP
 #define SDL_EVENT_MOUSE_WHEEL           SDL_MOUSEWHEEL
+/* Typing. Missing here until the debug console learned to type into the chat
+ * box, at which point every SDL2 build stopped compiling -- the shim is what
+ * lets the rest of the tree name events the SDL3 way, so a name it does not
+ * cover is a build break rather than a fallback. */
+#define SDL_EVENT_TEXT_INPUT            SDL_TEXTINPUT
+#define SDL_EVENT_TEXT_EDITING          SDL_TEXTEDITING
 #define SDL_EVENT_GAMEPAD_BUTTON_DOWN   SDL_CONTROLLERBUTTONDOWN
 #define SDL_EVENT_GAMEPAD_BUTTON_UP     SDL_CONTROLLERBUTTONUP
 #define SDL_EVENT_GAMEPAD_AXIS_MOTION   SDL_CONTROLLERAXISMOTION
@@ -40,6 +46,8 @@
 #define LNG_EVKEY(ev)    ((ev).key.keysym.sym)
 #define LNG_EVSCAN(ev)   ((ev).key.keysym.scancode)
 #define LNG_EVMOD(ev)    ((ev).key.keysym.mod)
+// key auto-repeat flag (same field name in SDL2/SDL3; Uint8 vs bool)
+#define LNG_EVKEYREPEAT(ev) ((ev).key.repeat != 0)
 // gamepad button event field: SDL3 ev.gbutton.button == SDL2 ev.cbutton.button
 #define LNG_EVGBTN(ev)   ((ev).cbutton.button)
 #define LNG_EVGBTNWHICH(ev) ((ev).cbutton.which)
@@ -72,6 +80,7 @@ typedef SDL_GameControllerAxis    LNG_GamepadAxis;
 #define LNG_EVKEY(ev)    ((ev).key.key)
 #define LNG_EVSCAN(ev)   ((ev).key.scancode)
 #define LNG_EVMOD(ev)    ((ev).key.mod)
+#define LNG_EVKEYREPEAT(ev) ((ev).key.repeat != 0)
 #define LNG_EVGBTN(ev)   ((ev).gbutton.button)
 #define LNG_EVGBTNWHICH(ev) ((ev).gbutton.which)
 #define LNG_EVGAXIS(ev)     ((ev).gaxis.axis)
