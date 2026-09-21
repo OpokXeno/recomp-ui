@@ -34,7 +34,7 @@ static const int kFreqCount   = (int)(sizeof(kFreqTable) / sizeof(kFreqTable[0])
 
 static const int kWindowWidths[]    = { 960, 1280, 1600, 1920 };
 static const int kWindowWidthCount  = (int)(sizeof(kWindowWidths) / sizeof(kWindowWidths[0]));
-static const int kFpsTable[]        = { 30, 60 };
+static const int kFpsTable[]        = { 30, 60, 120, 240 };
 static const int kFpsCount          = (int)(sizeof(kFpsTable) / sizeof(kFpsTable[0]));
 static const char* kScreenKindNames[4] = { "Raw", "CRT", "Composite", "Trinitron" };
 
@@ -1766,7 +1766,10 @@ void launcher_model_cycle_fps(LauncherModel* m) {
 
 const char* launcher_model_fps_label(const LauncherModel* m) {
     static char buf[24];
-    snprintf(buf, sizeof(buf), "%d FPS", m->s.fps == 60 ? 60 : 30);
+    int fps = 30;
+    for (int i = 0; i < kFpsCount; ++i)
+        if (kFpsTable[i] == m->s.fps) { fps = kFpsTable[i]; break; }
+    snprintf(buf, sizeof(buf), "%d FPS", fps);
     return buf;
 }
 

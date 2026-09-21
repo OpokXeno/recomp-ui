@@ -816,8 +816,8 @@ void launcher_model_toggle_dithering(LauncherModel* m);
 bool launcher_model_geometry_correction_inert(const LauncherModel* m);
 void launcher_model_cycle_screen_kind(LauncherModel* m);       // Raw/CRT/Composite/Trinitron
 const char* launcher_model_screen_kind_label(const LauncherModel* m);
-void launcher_model_cycle_fps(LauncherModel* m);                // {30,60} wrap
-const char* launcher_model_fps_label(const LauncherModel* m);   // "30 FPS"/"60 FPS"
+void launcher_model_cycle_fps(LauncherModel* m);                // {30,60,120,240} wrap
+const char* launcher_model_fps_label(const LauncherModel* m);   // "30/60/120/240 FPS"
 void launcher_model_toggle_spu_hq(LauncherModel* m);
 // Local rewind on/off. Off by default: the ring holds whole-machine snapshots
 // on a frame cadence, so it is opt-in rather than a cost every host pays.
