@@ -87,6 +87,10 @@
 extern "C" {
 void launcher_model_cycle_fps(LauncherModel* m);
 const char* launcher_model_fps_label(const LauncherModel* m);
+int launcher_model_fps_count(void);
+const char* launcher_model_fps_label_at(int index);
+void launcher_model_set_fps(LauncherModel* m, int index);
+int launcher_model_fps_index(const LauncherModel* m);
 }
 
 extern "C" const char* launcher_backend_name(void) { return "Dear ImGui"; }
@@ -3185,15 +3189,8 @@ static void draw_aspect_row(LauncherModel* m, const LauncherTheme& th) {
     }
     /* px(180) rather than the shared column, for the Screen layout reason:
      * both the label and the value come from the HOST, not from a vocabulary
-     * this file owns, and a button does not elide.
-     *
-     * The EXPERIMENTAL tag sits AFTER the button on the same line, so it has
-     * to be inside the width reserved here -- right-anchoring aligns the right
-     * edge of what it is told about, and a tag left out of the sum hangs off
-     * the card. */
+     * this file owns, and a button does not elide. */
     float ctrl_w = px(180);
-    if (m->aspect_experimental)
-        ctrl_w += px(8) + ImGui::CalcTextSize("EXPERIMENTAL").x;
     row_label_right(m->aspect_setting_label && m->aspect_setting_label[0]
                         ? m->aspect_setting_label
                         : "Aspect ratio",
@@ -3201,11 +3198,6 @@ static void draw_aspect_row(LauncherModel* m, const LauncherTheme& th) {
     ImGui::PushID("aspect_ratio");
     if (ImGui::Button(launcher_model_aspect_label(m), ImVec2(px(180), px(30))))
         launcher_model_cycle_aspect(m);
-    if (m->aspect_experimental) {
-        ImGui::SameLine(0, px(8));
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(col(th.warn), "EXPERIMENTAL");
-    }
     if (m->aspect_setting_help && m->aspect_setting_help[0] &&
         ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("%s", m->aspect_setting_help);
@@ -3445,10 +3437,22 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
     }
 
     if (m->has_frame_interp) {
+        /* A list, not a cycle button: seven entries are not countable
+         * by clicking through. Same pattern as the Renderer row. */
         row_label_right("FPS", th, px(SETTINGS_CTRL_W));
-        if (ImGui::Button(ui_text(launcher_model_fps_label(m)),
-                          ImVec2(px(SETTINGS_CTRL_W), px(30))))
-            launcher_model_cycle_fps(m);
+        ImGui::SetNextItemWidth(px(SETTINGS_CTRL_W));
+        if (ImGui::BeginCombo("##fps",
+                              ui_text(launcher_model_fps_label(m)))) {
+            const int n = launcher_model_fps_count();
+            const int cur = launcher_model_fps_index(m);
+            for (int i = 0; i < n; ++i) {
+                const char* lbl = launcher_model_fps_label_at(i);
+                if (!lbl || !lbl[0]) continue;
+                if (ImGui::Selectable(ui_text(lbl), cur == i))
+                    launcher_model_set_fps(m, i);
+            }
+            ImGui::EndCombo();
+        }
     }
 
     if (m->has_renderer) {

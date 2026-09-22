@@ -34,7 +34,7 @@ static const int kFreqCount   = (int)(sizeof(kFreqTable) / sizeof(kFreqTable[0])
 
 static const int kWindowWidths[]    = { 960, 1280, 1600, 1920 };
 static const int kWindowWidthCount  = (int)(sizeof(kWindowWidths) / sizeof(kWindowWidths[0]));
-static const int kFpsTable[]        = { 30, 60, 120, 240 };
+static const int kFpsTable[]        = { 30, 60, 75, 120, 144, 165, 240 };
 static const int kFpsCount          = (int)(sizeof(kFpsTable) / sizeof(kFpsTable[0]));
 static const char* kScreenKindNames[4] = { "Raw", "CRT", "Composite", "Trinitron" };
 
@@ -1771,6 +1771,29 @@ const char* launcher_model_fps_label(const LauncherModel* m) {
         if (kFpsTable[i] == m->s.fps) { fps = kFpsTable[i]; break; }
     snprintf(buf, sizeof(buf), "%d FPS", fps);
     return buf;
+}
+
+int launcher_model_fps_count(void) {
+    return kFpsCount;
+}
+
+const char* launcher_model_fps_label_at(int index) {
+    static char buf[24];
+    if (index < 0 || index >= kFpsCount) return NULL;
+    snprintf(buf, sizeof(buf), "%d FPS", kFpsTable[index]);
+    return buf;
+}
+
+void launcher_model_set_fps(LauncherModel* m, int index) {
+    if (!m || index < 0 || index >= kFpsCount) return;
+    m->s.fps = kFpsTable[index];
+}
+
+int launcher_model_fps_index(const LauncherModel* m) {
+    if (!m) return 0;
+    for (int i = 0; i < kFpsCount; ++i)
+        if (kFpsTable[i] == m->s.fps) return i;
+    return 0;
 }
 
 void launcher_model_toggle_spu_hq(LauncherModel* m) {
