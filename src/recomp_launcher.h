@@ -1414,7 +1414,12 @@ typedef struct RecompLauncherCDisc {
     // Optional display name for the dropdown row. NULL/"" => the launcher
     // shows "Disc <number>". Borrowed; must outlive the run_window call.
     const char* label;
-    // The image the build was made against (a .cue where one exists).
+    // The image the build was made against (a .cue where one exists), or
+    // the player's located copy. NULL/"" => an unlocated slot: the dropdown
+    // still offers it, selecting it mounts nothing and keeps PLAY disabled,
+    // and "Browse For Disc N" binds it. A build that ships no image paths
+    // publishes every slot this way. Every located disc is written to
+    // disc.cfg (one line per disc) the moment it is bound.
     // Borrowed; must outlive the run_window call.
     const char* path;
 } RecompLauncherCDisc;
