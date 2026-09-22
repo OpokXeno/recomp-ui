@@ -195,6 +195,8 @@ static int lm_disc_index_for_path(const LauncherModel* m, const char* path) {
     return -1;
 }
 
+static void lm_persist_disc_set(LauncherModel* m);  // fwd; defined with the sidecars
+
 // Bind rom_full to the roster after any ROM change. Either the new path IS a
 // roster image (select that slot) or the player browsed to a replacement for
 // the slot they had selected (record it as that slot's override) — never a
@@ -212,6 +214,7 @@ static void lm_bind_disc_selection(LauncherModel* m) {
     } else if (m->rom_present) {
         safe_copy(m->disc_path_override[m->disc_selected],
                   sizeof(m->disc_path_override[m->disc_selected]), m->rom_full);
+        lm_persist_disc_set(m);
     }
     m->s.disc_index = launcher_model_disc_number(m, m->disc_selected);
 }
@@ -291,20 +294,17 @@ void launcher_model_init(LauncherModel* m,
         m->has_player_name      = game->has_player_name != 0;
         m->identity_detail      = game->identity_detail;
         m->rom_noun             = game->rom_noun ? game->rom_noun : "ROM";
-        /* Multi-image roster. Only entries with a real path count: a host that
-         * declared N discs but left one path NULL publishes a set the player
-         * could select an unmountable slot from, so the roster stops at the
-         * first hole rather than offering a row that cannot boot. */
+        /* Multi-image roster. Every declared disc counts, located or not: a
+         * build may ship no image paths at all (the player owns the images and
+         * keeps them wherever they like), so an empty path is an unlocated
+         * slot, not the end of the set. Selecting one leaves nothing mounted --
+         * PLAY stays disabled and "Browse For Disc N" binds that slot -- so it
+         * can never boot a missing image. */
         m->discs                = game->discs;
         m->num_discs            = 0;
-        if (game->discs && game->num_discs > 0) {
-            const int cap = game->num_discs < LNG_MAX_DISCS
-                                ? game->num_discs : LNG_MAX_DISCS;
-            while (m->num_discs < cap &&
-                   game->discs[m->num_discs].path &&
-                   game->discs[m->num_discs].path[0])
-                m->num_discs++;
-        }
+        if (game->discs && game->num_discs > 0)
+            m->num_discs = game->num_discs < LNG_MAX_DISCS
+                               ? game->num_discs : LNG_MAX_DISCS;
         if (m->num_discs == 0) m->discs = NULL;
         m->language_labels      = game->language_labels;
         m->num_languages        = game->num_languages;
@@ -994,6 +994,7 @@ void launcher_model_set_disc_path(LauncherModel* m, int idx, const char* path) {
     }
     safe_copy(m->disc_path_override[idx], sizeof(m->disc_path_override[idx]),
               (path && path[0]) ? path : "");
+    lm_persist_disc_set(m);
     /* Locating the SELECTED disc is also a statement about what is mounted, so
      * rebind the ROM and let verification re-run. Locating any other slot is
      * pure bookkeeping and must NOT disturb the current mount or verdict --
@@ -2081,6 +2082,36 @@ static int lm_compose_disc_cfg(LauncherModel* m, char* out, size_t cap) {
         out[o] = '\0';
     }
     return launcher_model_discs_ready_count(m) > 0;
+}
+
+/* Persist where the player located every disc of a set the moment any slot
+ * is bound. PLAY hands the host only the SELECTED disc, so a disc located on
+ * the way (browse disc 2, then play disc 1) would otherwise be forgotten.
+ * Writes disc.cfg alone, in the same places the setup flush does; rom.cfg and
+ * bios.cfg are not this event's business. */
+static void lm_persist_disc_set(LauncherModel* m) {
+    char exe_dir[1024];
+    char disc_cfg[LNG_MAX_DISCS * 520];
+    if (!m || m->num_discs <= 1 ||
+        !lm_compose_disc_cfg(m, disc_cfg, sizeof(disc_cfg)))
+        return;
+    lm_write_sidecar_in_dir(NULL, "disc.cfg", disc_cfg);
+    if (lm_running_exe_dir(exe_dir, sizeof(exe_dir)))
+        lm_write_sidecar_in_dir(exe_dir, "disc.cfg", disc_cfg);
+    if (m->relaunch_exe[0]) {
+        char rdir[1024];
+        const char* slash = strrchr(m->relaunch_exe, '/');
+        const char* bslash = strrchr(m->relaunch_exe, '\\');
+        const char* cut = slash;
+        if (bslash && (!cut || bslash > cut)) cut = bslash;
+        if (cut && cut > m->relaunch_exe &&
+            (size_t)(cut - m->relaunch_exe) < sizeof(rdir)) {
+            const size_t n = (size_t)(cut - m->relaunch_exe);
+            memcpy(rdir, m->relaunch_exe, n);
+            rdir[n] = '\0';
+            lm_write_sidecar_in_dir(rdir, "disc.cfg", disc_cfg);
+        }
+    }
 }
 
 static void lm_persist_setup_sidecars(LauncherModel* m) {
