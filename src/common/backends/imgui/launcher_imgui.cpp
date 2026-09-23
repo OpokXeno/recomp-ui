@@ -10593,6 +10593,66 @@ static void draw_mod_catalog_diagnostics(LauncherModel* m,
     ImGui::Spacing();
 }
 
+/* Registers a user-picked HD texture folder with the host and selects its
+ * new entry. The folder is only referenced, never copied. */
+static void add_texture_pack(LauncherModel* m, int previous_count) {
+    const auto* mods = m->mods;
+    char folder[RECOMP_LAUNCHER_MOD_PATH_MAX] = {};
+    if (!launcher_pick_folder(ui_text("Select Texture Pack Folder"), folder,
+                              sizeof(folder))) {
+        if (!launcher_native_file_picker_available())
+            std::snprintf(m->mod_status, sizeof(m->mod_status),
+                          "No native folder picker is available.");
+        return;
+    }
+    if (!mods->texture_pack_add(mods->ctx, folder)) {
+        mod_note_error(m);
+        return;
+    }
+    const int count = mods->feature_count(mods->ctx);
+    for (int index = count - 1; index >= 0; --index) {
+        RecompLauncherCModFeature feature{};
+        if (mods->feature_get(mods->ctx, index, &feature) &&
+            feature.texture_pack) {
+            if (count > previous_count) m->mod_selected = index;
+            break;
+        }
+    }
+    std::snprintf(m->mod_status, sizeof(m->mod_status), "%s",
+                  ui_text("Texture pack added. It is used when you press PLAY."));
+}
+
+/* Detail pane of an HD texture pack entry: where it lives and how to drop it. */
+static void draw_texture_pack_detail(LauncherModel* m, const LauncherTheme& th,
+                                     const RecompLauncherCModFeature& feature) {
+    const auto* mods = m->mods;
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextColored(col(th.accent), "%s", ui_text("Folder"));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+    ImGui::TextWrapped("%s", feature.texture_pack_path);
+    ImGui::PopTextWrapPos();
+    if (feature.has_error && feature.status[0])
+        ImGui::TextColored(col(th.warn), "%s", feature.status);
+    else
+        ImGui::TextColored(col(th.accent2), "%d %s", feature.texture_pack_images,
+                           ui_text("replacement images"));
+    ImGui::Spacing();
+    if (mods->texture_pack_remove &&
+        ImGui::Button(ui_text("Remove from list"))) {
+        if (!mods->texture_pack_remove(mods->ctx, feature.package_id,
+                                       feature.id)) {
+            mod_note_error(m);
+        } else {
+            if (m->mod_selected > 0) --m->mod_selected;
+            std::snprintf(m->mod_status, sizeof(m->mod_status), "%s",
+                          ui_text("Texture pack removed. Its folder was not touched."));
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", ui_text("The folder and its images are kept on disk."));
+}
+
 static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
     const auto* mods = m ? m->mods : nullptr;
     if (!mods || !mods->feature_count || !mods->feature_get ||
@@ -10626,6 +10686,16 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
         else if (selected < 0)
             std::snprintf(m->mod_status, sizeof(m->mod_status),
                           "No native multi-file picker is available.");
+    }
+    if (mods->texture_pack_add) {
+        ImGui::SameLine();
+        if (ImGui::Button(ui_text("Add Texture Pack")))
+            add_texture_pack(m, feature_count);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", ui_text(
+                "Pick a folder of replacement textures made for Beetle PSX HW "
+                "(RetroArch): the <name>-texture-replacements folder or the "
+                "folder that contains it."));
     }
     ImGui::SameLine();
     if (ImGui::Button(ui_text("Enable all")))
@@ -10826,6 +10896,9 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
                 }
                 ImGui::Spacing();
             }
+
+            if (feature.texture_pack)
+                draw_texture_pack_detail(m, th, feature);
 
             // The list-row checkbox is the single enable/disable control.
             // The detail pane owns configuration values only.

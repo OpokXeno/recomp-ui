@@ -867,6 +867,13 @@ typedef struct RecompLauncherCModFeature {
      * never reach a shipped build at all -- when one appears here, this is a
      * local developer build. Appended for ABI stability. */
     int  channel;
+    /* Non-zero for an HD texture pack registered through texture_pack_add:
+     * an external replacement folder, not an installed package. The UI offers
+     * removal instead of package management and shows the folder. Appended
+     * for ABI stability; zero keeps every existing feature unchanged. */
+    int  texture_pack;
+    int  texture_pack_images;
+    char texture_pack_path[RECOMP_LAUNCHER_MOD_PATH_MAX];
 } RecompLauncherCModFeature;
 
 typedef struct RecompLauncherCModOption {
@@ -1012,6 +1019,15 @@ typedef struct RecompLauncherCModProvider {
     int (*catalog_diagnostic_count)(void* ctx);
     int (*catalog_diagnostic_get)(void* ctx, int index,
                                   RecompLauncherCModDiagnostic* out);
+    /* Optional HD texture replacement packs. texture_pack_add registers the
+     * folder the user picked (validated by the host, which reports why a
+     * folder is not a pack via last_error) and lists it as an enabled feature
+     * with texture_pack set; texture_pack_remove forgets it without touching
+     * the folder. NULL hides the "Add Texture Pack" button. Appended for ABI
+     * stability. */
+    int (*texture_pack_add)(void* ctx, const char* folder);
+    int (*texture_pack_remove)(void* ctx, const char* package_id,
+                               const char* feature_id);
 } RecompLauncherCModProvider;
 
 // Plain-C mirror of the launcher's internal settings (bools as int).
