@@ -131,7 +131,6 @@ static const LauncherI18nEntry kItalian[] = {
     {"Renderer", "Renderer"},
     {"Supersampling", "Supersampling"},
     {"Antialiasing", "Antialiasing"},
-    {"FMV filtering", "Filtro FMV"},
     {"Nearest", "Nearest"},
     {"Bilinear", "Bilineare"},
     {"Sharp", "Nitido"},

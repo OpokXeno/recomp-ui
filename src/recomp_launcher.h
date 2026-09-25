@@ -1055,8 +1055,7 @@ struct RecompLauncherCSettings {
     int  window_width;        // px window width (height follows aspect)
     int  renderer;            // 0 = software, 1 = OpenGL
     int  supersampling;       // 1..8
-    int  antialiasing;        // MSAA sample count: 0 = off, else 2/4/8 (x). (A
-                              // legacy on/off host may still write 0/1.)
+    int  antialiasing;        // 0=Off, 1=FXAA, 2=SMAA, 3=TAA, 4=MSAA, 5=SSAA
     int  texture_filter;      // 0 = nearest, 1 = bilinear
     int  screen_kind;         // 0 raw, 1 CRT, 2 composite, 3 trinitron
     int  frame_interp;        // bool
@@ -1240,16 +1239,8 @@ struct RecompLauncherCSettings {
      * Appended for ABI stability; see GameInfo.has_shader. */
     char shader_path[512];
 
-    /* How a low-res FMV is reconstructed when it is scaled up to the window.
-     * Separate from texture_filter: that one is about the 3D rasterizer's
-     * texture sampling, this one is about a decoded video frame, and the right
-     * answer differs (a movie wants reconstruction, a PSX texture usually wants
-     * the native look). Only consulted while antialiasing is on.
-     *   0 = unset -> the model seeds RECOMP_LAUNCHER_FMV_FILTER_BICUBIC
-     *   1 nearest, 2 bilinear, 3 sharp-bilinear, 4 bicubic
-     * Stored 1-based so a zero-initialized host predating the field gets the
-     * default rather than silently pinning "nearest". See GameInfo.has_fmv_filter.
-     * Appended additively. */
+    /* Retired FMV filtering field (1-based). Retained in the shared layout;
+     * no longer exposed or used by the PSX launcher/presenter. */
     int  fmv_filter;
 
     /* Driver vsync at present time (GameInfo.has_vsync consoles).
@@ -1335,6 +1326,9 @@ struct RecompLauncherCSettings {
      * it had. RECOMP_LAUNCHER_RUN_AHEAD_MAX bounds what the UI offers.
      * Appended for ABI stability. */
     int  run_ahead;
+    /* Independent AA quality multiplier: 1x/2x/4x/8x/16x. PSX Native only;
+     * 0 from an older host selects the 4x default. */
+    int  antialiasing_factor;
 };
 
 /* Largest run-ahead depth the launcher will offer for
@@ -1864,7 +1858,7 @@ typedef struct RecompLauncherCGameInfo {
     /* Display row for Settings.shader_path. Appended for ABI stability. */
     int has_shader;
 
-    /* Display row for Settings.fmv_filter. Only meaningful for a console whose
+    /* Retired display row for Settings.fmv_filter. Only meaningful for a console whose
      * runtime decodes full-motion video into a low-res buffer it then scales
      * (PSX and friends); everything else leaves this 0 and the row is absent.
      * Appended for ABI stability. */

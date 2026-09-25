@@ -797,7 +797,9 @@ const char* launcher_model_renderer_label_at(const LauncherModel* m, int i);
 void        launcher_model_set_renderer(LauncherModel* m, int index);
 void launcher_model_cycle_supersampling(LauncherModel* m);     // 1x..8x wrap
 const char* launcher_model_supersampling_label(const LauncherModel* m);
-void launcher_model_cycle_aa(LauncherModel* m);            // Off/2x/4x/8x (MSAA sample count)
+bool launcher_model_has_aa_modes(const LauncherModel* m);  // PSX Native AA vocabulary
+void launcher_model_cycle_aa(LauncherModel* m);            // PSX modes / legacy MSAA counts
+void launcher_model_cycle_aa_factor(LauncherModel* m);     // 1x/2x/4x/8x/16x
 const char* launcher_model_aa_label(const LauncherModel* m);
 void launcher_model_toggle_texture_filter(LauncherModel* m);   // Nearest/Bilinear
 const char* launcher_model_texture_filter_label(const LauncherModel* m);

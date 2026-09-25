@@ -650,6 +650,17 @@ void launcher_model_init(LauncherModel* m,
         if (!ok) m->s.window_width = kWindowWidths[0];
     }
     if (m->has_supersampling) m->s.supersampling = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
+    if (launcher_model_has_aa_modes(m) &&
+        (m->s.antialiasing < 0 || m->s.antialiasing > 5))
+        m->s.antialiasing = 0;
+    if (launcher_model_has_aa_modes(m) &&
+        m->s.antialiasing_factor != 1 && m->s.antialiasing_factor != 2 &&
+        m->s.antialiasing_factor != 4 && m->s.antialiasing_factor != 8 &&
+        m->s.antialiasing_factor != 16)
+        m->s.antialiasing_factor = 4;
+    if (launcher_model_has_aa_modes(m) && m->s.antialiasing == 3 &&
+        m->s.antialiasing_factor > 4)
+        m->s.antialiasing_factor = 4;
     if (m->has_screen_kind) {
         // Clamp against the active profile's screen-model vocabulary (GBA has
         // 5 LCD models; the legacy PSX-era set has 4) — see screen_kind_vocab.
@@ -1656,25 +1667,45 @@ const char* launcher_model_supersampling_label(const LauncherModel* m) {
     return buf;
 }
 
-// Antialiasing is an MSAA sample COUNT, not a bool: Off / 2x / 4x / 8x. Cycle
-// wraps 0 -> 2 -> 4 -> 8 -> 0. A legacy on/off host value of 1 is treated as
-// "on" by the label and advances to Off on the next cycle.
 void launcher_model_cycle_aa(LauncherModel* m) {
-    switch (m->s.antialiasing) {
-        case 0:  m->s.antialiasing = 2; break;
-        case 2:  m->s.antialiasing = 4; break;
-        case 4:  m->s.antialiasing = 8; break;
-        default: m->s.antialiasing = 0; break;   // 8 (or legacy 1/other) -> Off
+    if (launcher_model_has_aa_modes(m)) {
+        m->s.antialiasing = m->s.antialiasing >= 1 && m->s.antialiasing <= 5
+            ? m->s.antialiasing - 1 : 5;
+        if (m->s.antialiasing == 3 && m->s.antialiasing_factor > 4)
+            m->s.antialiasing_factor = 4;
+    } else {
+        switch (m->s.antialiasing) {
+            case 0: m->s.antialiasing = 2; break;
+            case 2: m->s.antialiasing = 4; break;
+            case 4: m->s.antialiasing = 8; break;
+            default: m->s.antialiasing = 0; break;
+        }
     }
 }
 
+void launcher_model_cycle_aa_factor(LauncherModel* m) {
+    if (!m || !launcher_model_has_aa_modes(m)) return;
+    int n = m->s.antialiasing_factor;
+    m->s.antialiasing_factor = n == 1 ? 2 : n == 2 ? 4 :
+        n == 4 ? (m->s.antialiasing == 3 ? 1 : 8) : n == 8 ? 16 : 1;
+}
+
+bool launcher_model_has_aa_modes(const LauncherModel* m) {
+    const SystemProfile* profile = m ? (const SystemProfile*)m->profile : NULL;
+    return profile && profile->id && strcmp(profile->id, "psx") == 0;
+}
+
 const char* launcher_model_aa_label(const LauncherModel* m) {
-    switch (m->s.antialiasing) {
-        case 0:  return "Off";
-        case 2:  return "2x";
-        case 4:  return "4x";
-        case 8:  return "8x";
-        default: return "On";   // legacy on/off host value (1)
+    static const char* labels[] = {"Off", "FXAA", "SMAA", "TAA", "MSAA", "SSAA"};
+    const int mode = m->s.antialiasing;
+    if (launcher_model_has_aa_modes(m))
+        return mode >= 0 && mode < 6 ? labels[mode] : labels[0];
+    switch (mode) {
+        case 0: return "Off";
+        case 2: return "2x";
+        case 4: return "4x";
+        case 8: return "8x";
+        default: return "On";
     }
 }
 
