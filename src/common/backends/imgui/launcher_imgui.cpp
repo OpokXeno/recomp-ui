@@ -3211,7 +3211,8 @@ static void draw_aspect_row(LauncherModel* m, const LauncherTheme& th) {
 // has_fullscreen_toggle no longer gates anything — see recomp_launcher.h).
 bool any_deep_display(const LauncherModel* m) {
     return m->has_window_size || m->has_renderer || m->has_supersampling ||
-           m->has_antialiasing || m->has_texture_filter || m->has_screen_kind ||
+           m->has_antialiasing || m->has_texture_filter ||
+           m->has_sprite_filter || m->has_anisotropic_filtering || m->has_screen_kind ||
            m->has_frame_interp || m->has_skip_fmv ||
            m->has_geometry_precision || m->has_dithering ||
            m->has_rewind_depth;
@@ -3514,12 +3515,33 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
             launcher_model_cycle_scaling_filter(m);
     } else if (m->has_texture_filter) {
         row_label_right("Texture filtering", th, px(SETTINGS_CTRL_W));
+        ImGui::PushID("texture_filter");
         if (ImGui::Button(ui_text(launcher_model_texture_filter_label(m)), ImVec2(px(SETTINGS_CTRL_W), px(30))))
             launcher_model_toggle_texture_filter(m);
+        ImGui::PopID();
     } else {
         row_label_right("Linear filtering", th, cb);
         bool filter = m->s.linear_filter != 0;
         if (ImGui::Checkbox("##filter", &filter)) launcher_model_toggle_filter(m);
+    }
+    if (m->has_sprite_filter) {
+        row_label_right("Sprite filtering", th, px(SETTINGS_CTRL_W));
+        ImGui::PushID("sprite_filter");
+        if (ImGui::Button(ui_text(launcher_model_sprite_filter_label(m)),
+                          ImVec2(px(SETTINGS_CTRL_W), px(30))))
+            launcher_model_toggle_sprite_filter(m);
+        ImGui::PopID();
+    }
+    if (m->has_anisotropic_filtering) {
+        row_label_right("Anisotropic filtering", th, px(SETTINGS_CTRL_W));
+        ImGui::PushID("anisotropic_filtering");
+        if (ImGui::Button(ui_text(launcher_model_anisotropic_filtering_label(m)),
+                          ImVec2(px(SETTINGS_CTRL_W), px(30))))
+            launcher_model_cycle_anisotropic_filtering(m);
+        ImGui::PopID();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Directional filtering of angled 3D scene textures.\n"
+                              "Works with Nearest or Bilinear; sprites/UI are unchanged.");
     }
 
     if (m->has_frame_blend) {

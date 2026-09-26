@@ -1329,6 +1329,8 @@ struct RecompLauncherCSettings {
     /* Independent AA quality multiplier: 1x/2x/4x/8x/16x. PSX Native only;
      * 0 from an older host selects the 4x default. */
     int  antialiasing_factor;
+    int  sprite_filter;      // 0=nearest, 1=bilinear; independent of texture_filter
+    int  anisotropic_filtering; // Native 3D textures: 0=off, 2/4/8/16x
 };
 
 /* Largest run-ahead depth the launcher will offer for
@@ -1952,6 +1954,8 @@ typedef struct RecompLauncherCGameInfo {
      * console whose runtime cannot snapshot-and-restore a frame keeps
      * exactly today's settings surface. Appended for ABI stability. */
     int has_run_ahead;
+    int has_sprite_filter;   // independent sprite/UI filtering row
+    int has_anisotropic_filtering; // independent 3D texture quality row
 } RecompLauncherCGameInfo;
 
 /* recomp_launcher_run_window return codes */

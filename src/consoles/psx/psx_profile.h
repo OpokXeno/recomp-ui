@@ -158,6 +158,8 @@ static inline void launcher_profile_apply_psx(RecompLauncherCGameInfo* gi) {
     // Full PS1 settings surface.
     gi->has_window_size = 1; gi->has_renderer = 0; gi->has_supersampling = 1;
     gi->has_antialiasing = 1; gi->has_texture_filter = 1; gi->has_screen_kind = 1;
+    gi->has_sprite_filter = 1;
+    gi->has_anisotropic_filtering = 1;
     gi->has_geometry_precision = 0; /* PGXP is framework-owned, not launcher UI. */
     gi->has_dithering = 1;     /* Master dithering on/off; a plain renderer
                                 * toggle, not per-title validated content. */

@@ -124,6 +124,7 @@ static const LauncherI18nEntry kItalian[] = {
     {"Scaling filter", "Filtro scala"},
     {"Linear filtering", "Filtro lineare"},
     {"Texture filtering", "Filtro texture"},
+    {"Sprite filtering", "Filtro sprite"},
     {"Affine background smoothing", "Smussatura fondali affine"},
     {"Shader", "Shader"},
     {"Custom", "Personalizzato"},

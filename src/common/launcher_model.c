@@ -277,6 +277,8 @@ void launcher_model_init(LauncherModel* m,
         m->has_supersampling    = game->has_supersampling != 0;
         m->has_antialiasing     = game->has_antialiasing != 0;
         m->has_texture_filter   = game->has_texture_filter != 0;
+        m->has_sprite_filter    = game->has_sprite_filter != 0;
+        m->has_anisotropic_filtering = game->has_anisotropic_filtering != 0;
         m->has_fmv_filter       = game->has_fmv_filter != 0;
         m->has_screen_kind      = game->has_screen_kind != 0;
         m->has_frame_interp     = game->has_frame_interp != 0;
@@ -670,6 +672,11 @@ void launcher_model_init(LauncherModel* m,
         m->s.screen_kind = clampi(m->s.screen_kind, 0, sk_n - 1);
     }
     if (m->has_texture_filter) m->s.texture_filter = m->s.texture_filter ? 1 : 0;
+    if (m->has_sprite_filter) m->s.sprite_filter = m->s.sprite_filter ? 1 : 0;
+    if (m->has_anisotropic_filtering && m->s.anisotropic_filtering != 0 &&
+        m->s.anisotropic_filtering != 2 && m->s.anisotropic_filtering != 4 &&
+        m->s.anisotropic_filtering != 8 && m->s.anisotropic_filtering != 16)
+        m->s.anisotropic_filtering = 0;
     /* 0 = unset (a host predating the field): seed the default rather than
      * letting a memset pin the least useful value. */
     if (m->has_fmv_filter) {
@@ -1715,6 +1722,31 @@ void launcher_model_toggle_texture_filter(LauncherModel* m) {
 
 const char* launcher_model_texture_filter_label(const LauncherModel* m) {
     return m->s.texture_filter ? "Bilinear" : "Nearest";
+}
+
+void launcher_model_toggle_sprite_filter(LauncherModel* m) {
+    m->s.sprite_filter = !m->s.sprite_filter;
+}
+
+const char* launcher_model_sprite_filter_label(const LauncherModel* m) {
+    return m->s.sprite_filter ? "Bilinear" : "Nearest";
+}
+
+void launcher_model_cycle_anisotropic_filtering(LauncherModel* m) {
+    if (!m || !m->has_anisotropic_filtering) return;
+    const int n = m->s.anisotropic_filtering;
+    m->s.anisotropic_filtering = n == 0 ? 2 : n == 2 ? 4 :
+        n == 4 ? 8 : n == 8 ? 16 : 0;
+}
+
+const char* launcher_model_anisotropic_filtering_label(const LauncherModel* m) {
+    switch (m->s.anisotropic_filtering) {
+        case 2: return "2x";
+        case 4: return "4x";
+        case 8: return "8x";
+        case 16: return "16x";
+        default: return "Off";
+    }
 }
 
 void launcher_model_cycle_fmv_filter(LauncherModel* m) {
