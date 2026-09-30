@@ -287,6 +287,7 @@ void launcher_model_init(LauncherModel* m,
         m->has_vsync            = game->has_vsync != 0;
         m->has_skip_fmv         = game->has_skip_fmv != 0;
         m->has_turbo_loads      = game->has_turbo_loads != 0;
+        m->has_fast_map_load    = game->has_fast_map_load != 0;
         m->has_geometry_precision = game->has_geometry_precision != 0;
         m->has_dithering        = game->has_dithering != 0;
         // game->has_fullscreen_toggle is deliberately NOT read: the Fullscreen

@@ -3234,7 +3234,7 @@ bool video_card_grows(const LauncherModel* m) {
     if (any_deep_display(m)) return true;
     if (has_display_aspect_row(m)) return true;
     if (m->has_shader) return true;
-    if (m->has_sharp_filter || m->has_affine_filter) return true;
+    if (m->has_sharp_filter || m->has_affine_filter || m->has_fast_map_load) return true;
     if (m->has_frame_blend || m->has_vsync) return true;
     if (m->has_run_ahead) return true;
     if (m->num_display_layouts > 0) return true;
@@ -3367,6 +3367,14 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
                     "little motion ghosting.");
         }
         if (m->has_run_ahead) row_run_ahead(m, th);
+
+    if (m->has_fast_map_load) {
+        bool on = m->s.fast_map_load != 0;
+        if (ImGui::Checkbox(ui_text("Fast map load"), &on))
+            m->s.fast_map_load = on ? 1 : 0;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Shorten map-loading waits while keeping gameplay and fades at their normal speed.");
+    }
         // On/Off checkbox rather than the deep surface's tri-state dropdown:
         // legacy-surface hosts map this onto a boolean renderer flag, so
         // offering "Adaptive" here would promise what they cannot deliver.
@@ -3737,6 +3745,14 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
      * machine snapshots to move the player in time, and neither changes how
      * a frame is drawn. */
     if (m->has_run_ahead) row_run_ahead(m, th);
+
+    if (m->has_fast_map_load) {
+        bool on = m->s.fast_map_load != 0;
+        if (ImGui::Checkbox(ui_text("Fast map load"), &on))
+            m->s.fast_map_load = on ? 1 : 0;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Shorten map-loading waits while keeping gameplay and fades at their normal speed.");
+    }
 
     /* Turbo loads is deliberately NOT a Display row on any console. Load
      * acceleration is owned by the framework's Mods catalog (Fast Loading /

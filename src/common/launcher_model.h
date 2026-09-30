@@ -400,6 +400,7 @@ typedef struct {
     bool     has_vsync;
     bool     has_skip_fmv;
     bool     has_turbo_loads;
+    bool     has_fast_map_load;
     // PSX geometry precision: sub-pixel vertices + perspective-correct UVs.
     // One flag gates both rows (two halves of one enhancement); the settings
     // stay independent. false => both rows hidden.

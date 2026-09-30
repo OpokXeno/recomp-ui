@@ -1331,6 +1331,7 @@ struct RecompLauncherCSettings {
     int  antialiasing_factor;
     int  sprite_filter;      // 0=nearest, 1=bilinear; independent of texture_filter
     int  anisotropic_filtering; // Native 3D textures: 0=off, 2/4/8/16x
+    int  fast_map_load; // title-bounded map reads; host seeds the default
 };
 
 /* Largest run-ahead depth the launcher will offer for
@@ -1956,6 +1957,7 @@ typedef struct RecompLauncherCGameInfo {
     int has_run_ahead;
     int has_sprite_filter;   // independent sprite/UI filtering row
     int has_anisotropic_filtering; // independent 3D texture quality row
+    int has_fast_map_load; // title supplies a bounded map-read policy
 } RecompLauncherCGameInfo;
 
 /* recomp_launcher_run_window return codes */
