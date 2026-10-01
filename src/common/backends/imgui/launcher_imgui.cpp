@@ -9925,6 +9925,11 @@ struct ModInstallState {
     std::string first_failure;
     bool announced = false;
     bool active = false;
+    bool inspected = false;
+    bool awaiting_trust = false;
+    bool trusted = false;
+    int declined = 0;
+    RecompLauncherCModArchiveInspection inspection{};
 };
 
 static ModInstallState& mod_install_state() {
@@ -9974,12 +9979,17 @@ static void finish_mod_archive_install(LauncherModel* m,
                       state.failed == 1 ? "" : "s",
                       state.first_failure.c_str());
     }
+    if (state.declined) {
+        std::snprintf(m->mod_status, sizeof(m->mod_status),
+                      "%d installed; %d declined; %d failed. %s", state.installed,
+                      state.declined, state.failed, state.first_failure.c_str());
+    }
     state.active = false;
 }
 
 static void process_mod_archive_install(LauncherModel* m) {
     ModInstallState& state = mod_install_state();
-    if (!m || state.owner != m || !state.active) return;
+    if (!m || state.owner != m || !state.active || state.awaiting_trust) return;
     if (state.next >= state.paths.size()) {
         finish_mod_archive_install(m, state);
         return;
@@ -9994,8 +10004,28 @@ static void process_mod_archive_install(LauncherModel* m) {
     }
 
     const auto* mods = m->mods;
-    if (mods && mods->install_archive &&
-        mods->install_archive(mods->ctx, path.c_str())) {
+    if (!state.inspected && mods && mods->inspect_archive) {
+        if (!mods->inspect_archive(mods->ctx, path.c_str(), &state.inspection)) {
+            ++state.failed;
+            if (state.first_failure.empty()) {
+                const auto* error = mods->last_error ? mods->last_error(mods->ctx) : nullptr;
+                state.first_failure = error && *error ? error : "Cannot inspect package";
+            }
+            ++state.next;
+            state.announced = false;
+            return;
+        }
+        state.inspected = true;
+        if (state.inspection.native_code) {
+            state.awaiting_trust = true;
+            return;
+        }
+    }
+    const bool installed = mods && (state.trusted
+        ? (mods->install_trusted_archive && mods->install_trusted_archive(
+            mods->ctx, path.c_str(), state.inspection.archive_sha256))
+        : (mods->install_archive && mods->install_archive(mods->ctx, path.c_str())));
+    if (installed) {
         ++state.installed;
     } else {
         ++state.failed;
@@ -10011,6 +10041,9 @@ static void process_mod_archive_install(LauncherModel* m) {
     }
     ++state.next;
     state.announced = false;
+    state.inspected = false;
+    state.trusted = false;
+    state.inspection = {};
     if (state.next >= state.paths.size())
         finish_mod_archive_install(m, state);
 }
@@ -10031,6 +10064,36 @@ static void draw_mod_archive_install_progress(LauncherModel* m,
         ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
         state = {};
+        return;
+    }
+    if (state.awaiting_trust) {
+        ImGui::TextColored(col(th.accent2), "%s", ui_text("Trust native code?"));
+        ImGui::TextWrapped("%s %s", state.inspection.name, state.inspection.version);
+        ImGui::TextWrapped("%s: %s", ui_text("Author"), state.inspection.author);
+        ImGui::TextWrapped("%s", mod_archive_filename(state.paths[state.next].c_str()));
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", ui_text(
+            "This mod contains native C/C++ code that runs with the same permissions as the game. "
+            "It can access your files, execute programs, or harm your computer. "
+            "Install only mods from sources you trust. Are you sure you want to install it?"));
+        ImGui::Spacing();
+        /* Decline first: keyboard/gamepad default navigation must not consent. */
+        if (ImGui::Button(ui_text("Do not trust"))) {
+            ++state.declined;
+            ++state.next;
+            state.awaiting_trust = false;
+            state.inspected = false;
+            state.trusted = false;
+            state.announced = false;
+            state.inspection = {};
+            if (state.next >= state.paths.size()) finish_mod_archive_install(m, state);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(ui_text("Trust and install"))) {
+            state.trusted = true;
+            state.awaiting_trust = false;
+        }
+        ImGui::EndPopup();
         return;
     }
     ImGui::TextColored(col(th.accent2), "Installing packages...");

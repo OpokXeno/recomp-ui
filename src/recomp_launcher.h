@@ -938,6 +938,12 @@ typedef struct RecompLauncherCModResource {
     char format[64];
 } RecompLauncherCModResource;
 
+typedef struct RecompLauncherCModArchiveInspection {
+    int native_code;
+    char name[256], author[256], package_id[128], version[64];
+    char archive_sha256[65];
+} RecompLauncherCModArchiveInspection;
+
 typedef struct RecompLauncherCModProvider {
     void* ctx;
     int (*package_count)(void* ctx);
@@ -1028,6 +1034,13 @@ typedef struct RecompLauncherCModProvider {
     int (*texture_pack_add)(void* ctx, const char* folder);
     int (*texture_pack_remove)(void* ctx, const char* package_id,
                                const char* feature_id);
+    /* Optional native-code installation handshake. Inspection never executes
+     * package code. A trust decision authorizes only this exact archive digest.
+     * install_archive must reject native packages without this handshake. */
+    int (*inspect_archive)(void* ctx, const char* path,
+                           RecompLauncherCModArchiveInspection* out);
+    int (*install_trusted_archive)(void* ctx, const char* path,
+                                   const char* archive_sha256);
 } RecompLauncherCModProvider;
 
 // Plain-C mirror of the launcher's internal settings (bools as int).

@@ -19,6 +19,16 @@ static const LauncherI18nEntry kItalian[] = {
     {"< Back", "< Indietro"},
     {"Set player name", "Imposta nome giocatore"},
     {"Install", "Installa"},
+    {"Author", "Autore"},
+    {"Trust native code?", "Fidarsi del codice nativo?"},
+    {"Do not trust", "Non fidarti"},
+    {"Trust and install", "Fidati e installa"},
+    {"This mod contains native C/C++ code that runs with the same permissions as the game. "
+     "It can access your files, execute programs, or harm your computer. "
+     "Install only mods from sources you trust. Are you sure you want to install it?",
+     "Questa mod contiene codice C/C++ nativo che viene eseguito con gli stessi permessi del gioco. "
+     "Può accedere ai tuoi file, eseguire programmi o danneggiare il computer. "
+     "Installa solo mod da fonti fidate. Vuoi davvero installarla?"},
     {"Install Mod Package", "Installa pacchetto mod"},
     {"Package installed. Changes apply when you press PLAY.",
      "Pacchetto installato. Le modifiche si applicano premendo GIOCA."},
