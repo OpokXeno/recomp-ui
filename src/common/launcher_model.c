@@ -1834,6 +1834,8 @@ const char* launcher_model_fps_label(const LauncherModel* m) {
     int fps = 30;
     for (int i = 0; i < kFpsCount; ++i)
         if (kFpsTable[i] == m->s.fps) { fps = kFpsTable[i]; break; }
+    /* 30 means the game's own designed cadence, not a fixed 30 FPS. */
+    if (fps == 30) return "Original";
     snprintf(buf, sizeof(buf), "%d FPS", fps);
     return buf;
 }
@@ -1845,6 +1847,7 @@ int launcher_model_fps_count(void) {
 const char* launcher_model_fps_label_at(int index) {
     static char buf[24];
     if (index < 0 || index >= kFpsCount) return NULL;
+    if (kFpsTable[index] == 30) return "Original";
     snprintf(buf, sizeof(buf), "%d FPS", kFpsTable[index]);
     return buf;
 }
