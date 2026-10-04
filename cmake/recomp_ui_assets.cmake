@@ -7,7 +7,8 @@ set(_RUI_COMMON_FONT_ASSETS
     "${RUI_ASSETS}/common/fonts/LatoLatin-Regular.ttf"
     "${RUI_ASSETS}/common/fonts/LatoLatin-Bold.ttf"
     "${RUI_ASSETS}/common/fonts/OpenMoji-black-glyf.ttf"
-    "${RUI_ASSETS}/common/fonts/NotoSansSymbols2-Regular.ttf")
+    "${RUI_ASSETS}/common/fonts/NotoSansSymbols2-Regular.ttf"
+    "${RUI_ASSETS}/common/fonts/DotGothic16-Regular.ttf")
 
 set(_RUI_COMMON_IMG_ASSETS
     "${RUI_ASSETS}/common/img/brand_mark.tga"

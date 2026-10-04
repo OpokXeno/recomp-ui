@@ -17,9 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define LNG_MAX_CMDS 64
+#define LNG_MAX_CMDS 4096
 
-static char  g_script[2048];
+static char  g_script[256 * 1024];
 static char* g_cmds[LNG_MAX_CMDS];
 static int   g_cmd_count = 0;
 static int   g_cmd_index = 0;
@@ -119,6 +119,10 @@ static void synth_click(LauncherPlatform* p, float x, float y) {
     SDL_PushEvent(&e);
 }
 
+/* Window the synthetic events target: ImGui's SDL backend drops key events
+ * whose windowID is not one of its viewports (0 included). */
+static Uint32 g_synth_window_id = 0;
+
 static void synth_key(SDL_Keycode key) {
     SDL_Scancode sc = SDL_GetScancodeFromKey(key
 #if defined(LNG_SDL3)
@@ -132,7 +136,9 @@ static void synth_key(SDL_Keycode key) {
     e.key.key = key;
     e.key.scancode = sc;
     e.key.down = true;
+    e.key.windowID = g_synth_window_id;
 #else
+    e.key.windowID = g_synth_window_id;
     e.key.keysym.sym = key;
     e.key.keysym.scancode = sc;
     e.key.state = SDL_PRESSED;
@@ -149,6 +155,7 @@ static void synth_key(SDL_Keycode key) {
 
 void launcher_debug_step(LauncherPlatform* p, LauncherModel* m) {
     if (!g_active) return;
+    g_synth_window_id = SDL_GetWindowID(p->window);
 
     // Never clobber an action the UI already set this frame (e.g. PLAY -> LAUNCH);
     // otherwise a script that clicks PLAY and then ends would overwrite LAUNCH

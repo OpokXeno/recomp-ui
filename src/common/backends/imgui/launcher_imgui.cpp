@@ -69,6 +69,7 @@
 #endif
 
 #include <algorithm>
+#include <functional>
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -779,6 +780,9 @@ static std::unordered_map<std::string, int> g_emoji_lookup;
 static bool    g_emoji_atlas_dirty = false;
 static int     g_emoji_px = 0;
 static ImFont* g_emoji_font = nullptr;
+/* The game-menu layout's own copy of the UI face, rasterised large so it can
+ * be drawn at any size the window calls for and stay sharp (launcher_xg.inc). */
+ImFont* g_xg_font = nullptr;
 static size_t  g_emoji_sprite_bytes = 0;
 #ifdef IMGUI_USE_WCHAR32
 static const ImWchar kEmojiPuaBase = 0xF0000;   /* Plane 15 private use */
@@ -1229,6 +1233,8 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
     static const ImWchar kRanges[] = {
         0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement
         0x2010, 0x2027,   // dashes, curly quotes, ellipsis (General Punctuation)
+        0x2190, 0x2193,   // ← ↑ → ↓ (button legend; the pixel font has them)
+        0x25B2, 0x25C0,   // ▲ ▶ ▼ ◀ (value arrows, scroll marks)
         0,
     };
     bool loaded = false;
@@ -1283,6 +1289,27 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
      * at LOGICAL resolution: a custom atlas rect draws at its texel size, so
      * rendering them denser would make them bigger, not sharper. Correct size,
      * a little soft on a HiDPI display — the one thing density cannot fix. */
+    {
+        static const ImWchar kXgRanges[] = {
+            0x0020, 0x00FF, 0x2010, 0x2027, 0x2190, 0x2193, 0x25B2, 0x25C0, 0,
+        };
+        static const ImWchar kXgSymbolRanges[] = {
+            0x2190, 0x21FF, 0x25A0, 0x25FF, 0x2700, 0x27BF, 0,
+        };
+        const float xg_px = 56.0f;
+        ImFontConfig xcfg;
+        xcfg.OversampleH = 1; xcfg.OversampleV = 1;
+        g_xg_font = (font_path && font_path[0])
+            ? io.Fonts->AddFontFromFileTTF(font_path, xg_px, &xcfg, kXgRanges) : nullptr;
+        if (g_xg_font && symbols_font_path && symbols_font_path[0]) {
+            if (FILE* sf = fopen(symbols_font_path, "rb")) {
+                fclose(sf);
+                ImFontConfig scfg; scfg.MergeMode = true;
+                scfg.OversampleH = 1; scfg.OversampleV = 1;
+                io.Fonts->AddFontFromFileTTF(symbols_font_path, xg_px, &scfg, kXgSymbolRanges);
+            }
+        }
+    }
     emoji_atlas_reserve(io.Fonts, base_font, body);
     io.Fonts->Build();
     emoji_atlas_blit(io.Fonts);
@@ -1343,6 +1370,12 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
 #else
     style.Colors[ImGuiCol_NavHighlight]    = col(th.focus_ring);
 #endif
+    // Dialog title bars in the window indigo instead of ImGui's stock blue.
+    style.Colors[ImGuiCol_TitleBg]          = ImVec4(0.224f, 0.224f, 0.388f, 1.0f);   // #393963
+    style.Colors[ImGuiCol_TitleBgActive]    = ImVec4(0.224f, 0.224f, 0.388f, 1.0f);
+    style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.224f, 0.224f, 0.388f, 1.0f);
+    style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.55f);
+    style.WindowBorderSize = 1.0f;
     ImGui::GetStyle() = style;
 }
 
@@ -4780,7 +4813,7 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
 
             if (s_snes_rename_open) ImGui::OpenPopup("Rename Controller");
             ImVec2 c2 = ImGui::GetMainViewport()->GetCenter();
-            ImGui::SetNextWindowPos(c2, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowPos(c2, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
             if (ImGui::BeginPopupModal("Rename Controller", &s_snes_rename_open,
                                        ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::TextUnformatted("Display name for this controller:");
@@ -4855,7 +4888,7 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
 
             if (s_n64_rename_open) ImGui::OpenPopup(ui_text("Rename Gamepad"));
             ImVec2 c3 = ImGui::GetMainViewport()->GetCenter();
-            ImGui::SetNextWindowPos(c3, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowPos(c3, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
             if (ImGui::BeginPopupModal(ui_text("Rename Gamepad"), &s_n64_rename_open,
                                        ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::TextUnformatted(ui_text("Display name for this gamepad:"));
@@ -4909,7 +4942,7 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
 
             if (s_rename_open) ImGui::OpenPopup(ui_text("Rename Gamepad"));
             ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-            ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
             if (ImGui::BeginPopupModal(ui_text("Rename Gamepad"), &s_rename_open,
                                        ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::TextUnformatted(ui_text("Display name for this gamepad:"));
@@ -6122,7 +6155,7 @@ static void np_open_name_modal(LauncherModel* m);
 void draw_netplay_player_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->netplay_name_modal_open) ImGui::OpenPopup("Player Name");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Player Name", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         const bool signed_in = draw_account_section(m, th);
         /* Signed in, the field edits the handle the SERVER owns; as a guest it
@@ -6347,7 +6380,7 @@ void draw_netplay_automatch_modal(LauncherModel* m, const LauncherTheme& th) {
     /* ---- queue-type picker ---------------------------------------------- */
     if (m->netplay_automatch_picker_open) ImGui::OpenPopup("Automatch");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Automatch", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextWrapped(
             "Pick a queue. The server owns these settings for the whole match "
@@ -6395,7 +6428,7 @@ void draw_netplay_automatch_modal(LauncherModel* m, const LauncherTheme& th) {
     }
     if (!gate) m->netplay_automatch_gate_open = false;
 
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Match found", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         if (!gate) {
             ImGui::CloseCurrentPopup();
@@ -6471,7 +6504,7 @@ void draw_netplay_automatch_modal(LauncherModel* m, const LauncherTheme& th) {
 void draw_netplay_moderation_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->netplay_moderation_modal_open) ImGui::OpenPopup("Ignored & Blocked");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(px(520), 0), ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal("Ignored & Blocked", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
@@ -6543,7 +6576,7 @@ void draw_netplay_report_modal(LauncherModel* m, const LauncherTheme& th) {
 
     if (m->netplay_report_modal_open) ImGui::OpenPopup("Report Message");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(px(520), 0), ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal("Report Message", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
@@ -6630,7 +6663,7 @@ void draw_netplay_report_modal(LauncherModel* m, const LauncherTheme& th) {
 void draw_netplay_direct_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->netplay_direct_modal_open) ImGui::OpenPopup("Join Direct");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Join Direct", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextWrapped(
             "Join a LAN/Direct IP lobby by IP (or pick a LAN row from the "
@@ -6702,7 +6735,7 @@ void draw_netplay_direct_modal(LauncherModel* m, const LauncherTheme& th) {
 void draw_netplay_network_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->netplay_network_modal_open) ImGui::OpenPopup("Network Settings");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(px(520), 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Network Settings", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -6742,7 +6775,7 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
     static char host_create_status[160] = "";
     if (m->netplay_host_modal_open) ImGui::OpenPopup("Host Lobby");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(px(520), 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Host Lobby", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextColored(col(th.text_muted), "Lobby name");
@@ -7066,7 +7099,7 @@ void draw_netplay_host_modal(LauncherModel* m, const LauncherTheme& th) {
 void draw_netplay_password_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->netplay_password_modal_open) ImGui::OpenPopup("Join Lobby");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Join Lobby", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::SetNextItemWidth(px(320));
         ImGui::InputText("Password", m->netplay_password, sizeof(m->netplay_password),
@@ -12508,7 +12541,7 @@ static const char* generate_disabled_reason(const LauncherModel* m) {
 void draw_bios_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->bios_confirm_open) ImGui::OpenPopup("Switch BIOS?");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("Switch BIOS?", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
         return;
@@ -12557,7 +12590,7 @@ void draw_bios_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
 void draw_bios_play_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->bios_play_modal_open) ImGui::OpenPopup("BIOS not ready to Play");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("BIOS not ready to Play", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
         return;
@@ -12603,7 +12636,7 @@ void draw_bios_play_modal(LauncherModel* m, const LauncherTheme& th) {
 void draw_pgo_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->pgo_confirm_open) ImGui::OpenPopup("Optimize FMV Playback?");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("Optimize FMV Playback?", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
         return;
@@ -12636,7 +12669,7 @@ void draw_fmv_timing_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
     if (m->fmv_timing_confirm_open)
         ImGui::OpenPopup("Apply FMV Timing Opt?");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("Apply FMV Timing Opt?", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
         return;
@@ -12667,13 +12700,16 @@ void draw_fmv_timing_confirm_modal(LauncherModel* m, const LauncherTheme& th) {
 void draw_skip_modal(LauncherModel* m) {
     if (m->skip_modal_open) ImGui::OpenPopup("Skip the launcher on boot?");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(px(420), 0), ImVec2(px(560), FLT_MAX));
     if (ImGui::BeginPopupModal("Skip the launcher on boot?", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (!m->skip_modal_open) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
         ImGui::TextWrapped("The launcher will no longer appear - the game boots straight in. "
                            "Run with \"--launcher\" or set \"SkipLauncher = 0\" in config.ini "
                            "to bring it back.");
         ImGui::Spacing();
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();   // Cancel is the safe default
         if (ImGui::Button("Cancel", ImVec2(px(120), 0))) {
             launcher_model_skip_cancel(m); ImGui::CloseCurrentPopup();
         }
@@ -12688,13 +12724,16 @@ void draw_skip_modal(LauncherModel* m) {
 void draw_restore_defaults_modal(LauncherModel* m) {
     if (m->defaults_modal_open) ImGui::OpenPopup("Restore default settings?");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(px(420), 0), ImVec2(px(560), FLT_MAX));
     if (ImGui::BeginPopupModal("Restore default settings?", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (!m->defaults_modal_open) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
         ImGui::TextWrapped(
             "This resets display, audio, controller, and launcher choices. "
             "Your selected ROM, SRAM, and save states are not changed.");
         ImGui::Spacing();
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();   // Cancel is the safe default
         if (ImGui::Button("Cancel", ImVec2(px(120), 0))) {
             launcher_model_cancel_restore_defaults(m);
             ImGui::CloseCurrentPopup();
@@ -12708,7 +12747,25 @@ void draw_restore_defaults_modal(LauncherModel* m) {
     }
 }
 
+// The Xenogears launcher (game-menu layout); see launcher_xg.inc.
+#include "launcher_xg.inc"
+
+void draw_ui_legacy(LauncherModel* m, const LauncherTheme& th, int logical_w, int logical_h);
+
+// Netplay keeps the original full-screen pages (mode picker, browser, sign-in,
+// lobby); everything else is the Xenogears game-menu layout.
 void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logical_h) {
+    const bool seated = m->netplay_supported && np_lobby_seated(m, np_cb(m));
+    const bool netplay_view = m->view == LNG_VIEW_NETPLAY || m->view == LNG_VIEW_NETPLAY_MODE ||
+                              m->view == LNG_VIEW_NETPLAY_SIGNIN || m->view == LNG_VIEW_LOBBY;
+    if (seated || netplay_view) {
+        draw_ui_legacy(m, th, logical_w, logical_h);
+        return;
+    }
+    draw_ui_xg(m, th);
+}
+
+void draw_ui_legacy(LauncherModel* m, const LauncherTheme& th, int logical_w, int logical_h) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
@@ -12952,6 +13009,14 @@ bool try_capture(LauncherModel* m, const SDL_Event& ev) {
         !m->camera_capturing)
         return false;
 
+    /* Releases always reach ImGui. A capture started by a press (Enter, a
+     * click) would otherwise eat that key's or button's own release, and ImGui
+     * would keep it held: the next Enter never registers as a new press, a
+     * "held" mouse keeps an item active and blocks input -- the launcher looks
+     * frozen until something is clicked again. A release binds nothing. */
+    if (ev.type == SDL_EVENT_KEY_UP || ev.type == SDL_EVENT_MOUSE_BUTTON_UP)
+        return false;
+
     // ESC cancels any capture — keyboard, pad, or hotkey.
     if (ev.type == SDL_EVENT_KEY_DOWN && LNG_EVKEY(ev) == SDLK_ESCAPE) {
         launcher_model_cancel_capture(m);
@@ -13177,7 +13242,10 @@ bool try_capture(LauncherModel* m, const SDL_Event& ev) {
                 // SDL emits GAMEPAD_BUTTON_DOWN for the same physical control.
                 if (psx_cap) {
                     const int slot = m->capture_btn;
-                    const bool stick_dir_slot = (slot >= 16 && slot < 24);
+                    // D-pad slots (0..3) take a stick direction too: on a
+                    // digital pad that is how a stick drives movement.
+                    const bool stick_dir_slot = (slot >= 0 && slot < 4) ||
+                                                (slot >= 16 && slot < 24);
 #if defined(LNG_SDL3)
                     const bool stick_axis =
                         axis == (int)SDL_GAMEPAD_AXIS_LEFTX ||
@@ -13430,7 +13498,11 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
                              "flags fall back to the emoji provider\n");
     launcher_boot_timing_mark("rui:textures_loaded");
 
-    std::string font_path = asset("assets/fonts/LatoLatin-Regular.ttf");
+    // Xenogears: the dot-matrix face close to the game's own menu font; Lato
+    // stays as the fallback when the pixel font was not staged.
+    std::string font_path = asset("assets/fonts/DotGothic16-Regular.ttf");
+    if (FILE* ff = fopen(font_path.c_str(), "rb")) fclose(ff);
+    else font_path = asset("assets/fonts/LatoLatin-Regular.ttf");
     // Optional Japanese subset, merged over the Latin base when present (PMS-J).
     // Games that don't ship it stay Latin-only (fopen in apply_scale fails
     // silently), so this path is inert for every other console.

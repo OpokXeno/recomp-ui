@@ -90,22 +90,29 @@ static inline LauncherTheme launcher_theme_default(void) {
 // CRT scanlines (the disc era, not the cartridge/CRT-arcade era). Same layout
 // and design language as the default; only the palette + scanline flag differ.
 static inline LauncherTheme launcher_theme_psx(void) {
+    /* Xenogears: the game's menu windows. Black ground, grey window fill,
+     * white-on-indigo lines and text, red for the cursor and the primary
+     * action. The game-menu layout (launcher_xg.inc) draws its own windows;
+     * these tokens dress the plain ImGui pages and modals to match. */
     LauncherTheme t = launcher_theme_default();   // inherit spacing/type/dims
-    t.background      = lng_rgba(0.039f, 0.047f, 0.078f, 1.0f); // #0A0C14 blue-black
-    t.background2     = lng_rgba(0.063f, 0.078f, 0.122f, 1.0f); // #10141F lifted center
-    t.panel           = lng_rgba(0.071f, 0.094f, 0.149f, 1.0f); // #121826 card
-    t.panel_hovered   = lng_rgba(0.110f, 0.153f, 0.251f, 1.0f); // #1C2740
-    t.control         = lng_rgba(0.086f, 0.114f, 0.180f, 1.0f); // #161D2E button
-    t.control_hovered = lng_rgba(0.129f, 0.176f, 0.271f, 1.0f); // #212D45
-    t.border          = lng_rgba(0.157f, 0.196f, 0.282f, 1.0f); // #283248 hairline
-    t.accent          = lng_rgba(0.180f, 0.490f, 1.000f, 1.0f); // #2E7DFF PlayStation blue
-    t.accent_dim      = lng_rgba(0.102f, 0.353f, 0.839f, 1.0f); // #1A5AD6 pressed/gradient
+    t.background      = lng_rgba(0.000f, 0.000f, 0.000f, 1.0f); // #000000
+    t.background2     = lng_rgba(0.020f, 0.020f, 0.031f, 1.0f); // #050508
+    t.panel           = lng_rgba(0.204f, 0.204f, 0.212f, 1.0f); // #343436 window fill
+    t.panel_hovered   = lng_rgba(0.255f, 0.255f, 0.275f, 1.0f); // #414146
+    t.control         = lng_rgba(0.133f, 0.133f, 0.165f, 1.0f); // #22222A
+    t.control_hovered = lng_rgba(0.231f, 0.227f, 0.357f, 1.0f); // #3B3A5B indigo gap
+    t.border          = lng_rgba(0.937f, 0.941f, 0.976f, 0.85f);// #EFF0F9 window line
+    t.accent          = lng_rgba(0.992f, 0.004f, 0.000f, 1.0f); // #FD0100 cursor red
+    t.accent_dim      = lng_rgba(0.620f, 0.000f, 0.000f, 1.0f); // #9E0000
     t.accent_text     = lng_rgba(1.0f, 1.0f, 1.0f, 1.0f);
-    t.accent2         = t.accent;                                // single-accent (blue)
-    t.text            = lng_rgba(0.910f, 0.925f, 0.961f, 1.0f); // #E8ECF5
-    t.text_muted      = lng_rgba(0.494f, 0.541f, 0.639f, 1.0f); // #7E8AA3
-    /* good/warn keep their semantic colors; focus stays cyan (reads clearly on blue). */
-    t.scanlines       = 0;                       // flat, no CRT scanlines
+    t.accent2         = lng_rgba(0.937f, 0.941f, 0.976f, 1.0f); // headings in window white
+    t.text            = lng_rgba(0.937f, 0.941f, 0.976f, 1.0f); // #EFF0F9
+    t.text_muted      = lng_rgba(0.553f, 0.549f, 0.596f, 1.0f); // #8D8C98 greyed
+    t.good            = lng_rgba(0.478f, 0.878f, 0.549f, 1.0f); // #7AE08C
+    t.focus_ring      = lng_rgba(1.000f, 0.157f, 0.118f, 1.0f); // #FF281E
+    t.radius_sm       = 4.0f;
+    t.radius_lg       = 5.0f;
+    t.scanlines       = 0;
     return t;
 }
 

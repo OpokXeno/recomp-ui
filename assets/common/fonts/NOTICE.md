@@ -13,3 +13,10 @@ Copyright © The Noto Project Authors
 License: [SIL Open Font License 1.1 (OFL-1.1)](https://scripts.sil.org/OFL)
 
 Used as a symbols fallback merged into the launcher UI font.
+
+## DotGothic16 (`DotGothic16-Regular.ttf`)
+
+Copyright © 2020 The DotGothic16 Project Authors (Fontworks Inc.)  
+License: [SIL Open Font License 1.1 (OFL-1.1)](https://scripts.sil.org/OFL)
+
+The launcher's UI font: a dot-matrix face close to Xenogears' own menu font.
