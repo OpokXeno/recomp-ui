@@ -1266,7 +1266,8 @@ struct RecompLauncherCSettings {
      * "no opinion". Appended additively. */
     int  vsync;
 
-    /* PSX presentation rate: 30 = original cadence, 60 = Native interpolation.
+    /* PSX presentation target, 30..240: 30 = original cadence; higher targets
+     * enable Native interpolation. Presets and custom targets are retained.
      * Zero-initialized hosts use the launcher's 30 FPS default. Appended for
      * ABI stability. */
     int  fps;

@@ -3478,7 +3478,7 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
     }
 
     if (m->has_frame_interp) {
-        /* A list, not a cycle button: seven entries are not countable
+        /* A list, not a cycle button: the presets are not countable
          * by clicking through. Same pattern as the Renderer row. */
         row_label_right("FPS", th, px(SETTINGS_CTRL_W));
         ImGui::SetNextItemWidth(px(SETTINGS_CTRL_W));
@@ -3486,6 +3486,8 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
                               ui_text(launcher_model_fps_label(m)))) {
             const int n = launcher_model_fps_count();
             const int cur = launcher_model_fps_index(m);
+            if (cur < 0)
+                ImGui::Selectable(ui_text(launcher_model_fps_label(m)), true);
             for (int i = 0; i < n; ++i) {
                 const char* lbl = launcher_model_fps_label_at(i);
                 if (!lbl || !lbl[0]) continue;

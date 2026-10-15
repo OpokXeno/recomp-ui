@@ -34,7 +34,7 @@ static const int kFreqCount   = (int)(sizeof(kFreqTable) / sizeof(kFreqTable[0])
 
 static const int kWindowWidths[]    = { 960, 1280, 1600, 1920 };
 static const int kWindowWidthCount  = (int)(sizeof(kWindowWidths) / sizeof(kWindowWidths[0]));
-static const int kFpsTable[]        = { 30, 60, 75, 120, 144, 165, 240 };
+static const int kFpsTable[]        = { 30, 60, 75, 90, 120, 144, 165, 240 };
 static const int kFpsCount          = (int)(sizeof(kFpsTable) / sizeof(kFpsTable[0]));
 static const char* kScreenKindNames[4] = { "Raw", "CRT", "Composite", "Trinitron" };
 
@@ -702,10 +702,9 @@ void launcher_model_init(LauncherModel* m,
         }
     }
     if (m->has_frame_interp) {
-        int ok = 0;
-        for (int i = 0; i < kFpsCount; ++i)
-            if (kFpsTable[i] == m->s.fps) { ok = 1; break; }
-        if (!ok) m->s.fps = 30;
+        /* Config accepts every target in this range, including values absent
+         * from the preset list. Opening the launcher must not rewrite them. */
+        if (m->s.fps < 30 || m->s.fps > 240) m->s.fps = 30;
     }
     if (m->has_vsync &&
         (m->s.vsync < 1 || m->s.vsync > RECOMP_LAUNCHER_VSYNC_COUNT)) {
@@ -1831,9 +1830,7 @@ void launcher_model_cycle_fps(LauncherModel* m) {
 
 const char* launcher_model_fps_label(const LauncherModel* m) {
     static char buf[24];
-    int fps = 30;
-    for (int i = 0; i < kFpsCount; ++i)
-        if (kFpsTable[i] == m->s.fps) { fps = kFpsTable[i]; break; }
+    const int fps = m && m->s.fps >= 30 && m->s.fps <= 240 ? m->s.fps : 30;
     /* 30 means the game's own designed cadence, not a fixed 30 FPS. */
     if (fps == 30) return "Original";
     snprintf(buf, sizeof(buf), "%d FPS", fps);
@@ -1861,7 +1858,7 @@ int launcher_model_fps_index(const LauncherModel* m) {
     if (!m) return 0;
     for (int i = 0; i < kFpsCount; ++i)
         if (kFpsTable[i] == m->s.fps) return i;
-    return 0;
+    return -1; /* A valid custom target, not the Original preset. */
 }
 
 void launcher_model_toggle_spu_hq(LauncherModel* m) {

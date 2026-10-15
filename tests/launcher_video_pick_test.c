@@ -81,6 +81,35 @@ int main(void) {
     ok(m.s.renderer == 0 && m.s.vsync == 0,
        "neither setter writes when the console does not have the control");
 
+    /* Loading and accepting settings must preserve every valid FPS target,
+     * including custom values absent from the preset dropdown. */
+    {
+        RecompLauncherCGameInfo game = {0};
+        game.has_frame_interp = 1;
+        int preserved = 1, labels_match = 1;
+        for (int fps = 30; fps <= 240; ++fps) {
+            RecompLauncherCSettings settings = {0}, committed = {0};
+            settings.fps = fps;
+            launcher_model_init(&m, &settings, &game, NULL);
+            launcher_model_commit(&m, &committed);
+            preserved &= m.s.fps == fps && committed.fps == fps;
+            char expected[24];
+            snprintf(expected, sizeof(expected), "%d FPS", fps);
+            const char *label = launcher_model_fps_label(&m);
+            labels_match &= strcmp(label, fps == 30 ? "Original" : expected) == 0;
+            const int index = launcher_model_fps_index(&m);
+            labels_match &= index < 0 || strcmp(launcher_model_fps_label_at(index), label) == 0;
+        }
+        ok(preserved, "opening/accepting the launcher preserves all valid FPS settings");
+        ok(labels_match, "FPS label and selection match presets and custom targets");
+        for (int fps = 0; fps <= 300; fps += 300) {
+            RecompLauncherCSettings settings = {0};
+            settings.fps = fps;
+            launcher_model_init(&m, &settings, &game, NULL);
+            ok(m.s.fps == 30, "invalid FPS defaults to Original");
+        }
+    }
+
     printf(fails ? "FAILED\n" : "PASSED\n");
     return fails;
 }
