@@ -3519,13 +3519,14 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
     }
 
     if (m->has_supersampling) {
-        row_label_right("Supersampling", th, px(SETTINGS_CTRL_W));
+        row_label_right(launcher_model_native_resolution_active(m) ? "Internal resolution" : "Supersampling", th, px(SETTINGS_CTRL_W));
         ImGui::PushID("supersampling");
         if (ImGui::Button(ui_text(launcher_model_supersampling_label(m)), ImVec2(px(SETTINGS_CTRL_W), px(30))))
             launcher_model_cycle_supersampling(m);
         ImGui::PopID();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
+            ImGui::SetTooltip(launcher_model_native_resolution_active(m) ?
+                "Fixed internal render resolution (Vulkan)." :
                 "Internal-resolution SSAA.\n"
                 "Offline: full software/GL supersampling.\n"
                 "Netplay (OpenGL): present quality via GPU FBO;\n"

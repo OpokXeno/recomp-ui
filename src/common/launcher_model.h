@@ -388,6 +388,8 @@ typedef struct {
     bool     has_window_size;
     bool     has_renderer;
     bool     has_supersampling;
+    bool     has_native_resolution;
+    int      native_resolution_renderer_index;
     bool     has_antialiasing;
     bool     has_texture_filter;
     bool     has_sprite_filter;
@@ -798,7 +800,8 @@ const char* launcher_model_renderer_label(const LauncherModel* m);
 int         launcher_model_renderer_count(const LauncherModel* m);
 const char* launcher_model_renderer_label_at(const LauncherModel* m, int i);
 void        launcher_model_set_renderer(LauncherModel* m, int index);
-void launcher_model_cycle_supersampling(LauncherModel* m);     // 1x..8x wrap
+bool launcher_model_native_resolution_active(const LauncherModel* m);
+void launcher_model_cycle_supersampling(LauncherModel* m);     // Fixed resolutions or 1x..8x
 const char* launcher_model_supersampling_label(const LauncherModel* m);
 bool launcher_model_has_aa_modes(const LauncherModel* m);  // PSX Native AA vocabulary
 void launcher_model_cycle_aa(LauncherModel* m);            // PSX modes / legacy MSAA counts

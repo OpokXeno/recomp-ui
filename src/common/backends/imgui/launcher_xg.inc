@@ -1043,7 +1043,8 @@ static std::vector<XgSection> xg_config_sections(LauncherModel* m) {
     {
         XgSection s; s.name = ui_text("Image");
         if (m->has_supersampling)
-            s.rows.push_back(xg_cycle_row("Supersampling", [m] { return std::string(launcher_model_supersampling_label(m)); },
+            s.rows.push_back(xg_cycle_row(launcher_model_native_resolution_active(m) ? "Internal resolution" : "Supersampling", [m] { return std::string(launcher_model_supersampling_label(m)); },
+                launcher_model_native_resolution_active(m) ? "Fixed internal render resolution." :
                 "Render at a higher internal resolution, then downscale. Sharper edges at the cost of GPU time.",
                 [m] { launcher_model_cycle_supersampling(m); }));
         if (m->has_antialiasing) {

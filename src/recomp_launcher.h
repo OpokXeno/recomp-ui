@@ -1067,7 +1067,9 @@ struct RecompLauncherCSettings {
     // has_* flags below — consoles that don't set the flags leave these unused) ----
     int  window_width;        // px window width (height follows aspect)
     int  renderer;            // 0 = software, 1 = OpenGL
-    int  supersampling;       // 1..8
+    int  supersampling;       // 1..8, used by integer-scale renderers
+    int  internal_width;      // Fixed raster dimensions, independent of window size
+    int  internal_height;
     int  antialiasing;        // 0=Off, 1=FXAA, 2=SMAA, 3=TAA, 4=MSAA, 5=SSAA
     int  texture_filter;      // 0 = nearest, 1 = bilinear
     int  screen_kind;         // 0 raw, 1 CRT, 2 composite, 3 trinitron
@@ -1516,6 +1518,8 @@ typedef struct RecompLauncherCGameInfo {
     int  has_window_size;       // px window-size control (else the legacy window_scale cycle stays)
     int  has_renderer;          // Software/OpenGL toggle
     int  has_supersampling;
+    int  has_native_resolution; // host can rasterize Native geometry at fixed pixel dimensions
+    int  native_resolution_renderer_index; // renderer dropdown entry supporting fixed dimensions
     int  has_antialiasing;
     int  has_texture_filter;    // Nearest/Bilinear (else the legacy Linear filtering checkbox stays)
     int  has_screen_kind;       // CRT/screen-model filter

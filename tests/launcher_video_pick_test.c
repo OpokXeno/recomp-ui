@@ -110,6 +110,49 @@ int main(void) {
         }
     }
 
+    /* Internal resolution belongs to the render target, not the window or
+     * renderer dropdown. Accepting settings must retain the exact pair. */
+    {
+        static const char* const apis[] = {"OpenGL", "Vulkan (Recommended)"};
+        RecompLauncherCGameInfo game = {0};
+        RecompLauncherCSettings settings = {0}, committed = {0};
+        game.has_renderer = game.has_supersampling = game.has_native_resolution = 1;
+        game.native_resolution_renderer_index = 1;
+        game.renderer_labels = apis;
+        game.num_renderers = 2;
+        settings.renderer = 1;
+        settings.internal_width = 3840;
+        settings.internal_height = 2160;
+        settings.supersampling = 4;
+        launcher_model_init(&m, &settings, &game, NULL);
+        ok(strcmp(launcher_model_supersampling_label(&m), "3840 x 2160") == 0,
+           "Vulkan (Recommended) shows the exact internal dimensions");
+        m.s.window_width = 640;
+        launcher_model_commit(&m, &committed);
+        ok(committed.internal_width == 3840 && committed.internal_height == 2160,
+           "changing window size and accepting settings preserves the 4K raster");
+        launcher_model_set_renderer(&m, 0);
+        launcher_model_cycle_supersampling(&m);
+        launcher_model_set_renderer(&m, 1);
+        ok(m.s.internal_width == 3840 && m.s.internal_height == 2160 && m.s.supersampling == 5,
+           "integer-scale settings and fixed resolution remain independent");
+        launcher_model_cycle_supersampling(&m);
+        ok(m.s.internal_width == 640 && m.s.internal_height == 480,
+           "the fixed resolution selector wraps after 4K");
+        settings.internal_width = settings.internal_height = 0;
+        launcher_model_init(&m, &settings, &game, NULL);
+        ok(m.s.internal_width == 1920 && m.s.internal_height == 1080,
+           "settings without a fixed resolution start at 1920 x 1080");
+        static const char* const translated_apis[] = {"OpenGL", "Vulkan (Recomendado)"};
+        m.renderer_labels = translated_apis;
+        ok(launcher_model_native_resolution_active(&m),
+           "translated renderer labels retain the fixed resolution control");
+        m.native_resolution_renderer_index = 0;
+        launcher_model_set_renderer(&m, 0);
+        ok(launcher_model_native_resolution_active(&m),
+           "the host can supply a different renderer order without relying on labels");
+    }
+
     printf(fails ? "FAILED\n" : "PASSED\n");
     return fails;
 }

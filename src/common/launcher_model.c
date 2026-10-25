@@ -275,6 +275,8 @@ void launcher_model_init(LauncherModel* m,
         m->has_window_size      = game->has_window_size != 0;
         m->has_renderer         = game->has_renderer != 0;
         m->has_supersampling    = game->has_supersampling != 0;
+        m->has_native_resolution = game->has_native_resolution != 0;
+        m->native_resolution_renderer_index = game->native_resolution_renderer_index;
         m->has_antialiasing     = game->has_antialiasing != 0;
         m->has_texture_filter   = game->has_texture_filter != 0;
         m->has_sprite_filter    = game->has_sprite_filter != 0;
@@ -652,7 +654,14 @@ void launcher_model_init(LauncherModel* m,
             if (kWindowWidths[i] == m->s.window_width) { ok = 1; break; }
         if (!ok) m->s.window_width = kWindowWidths[0];
     }
-    if (m->has_supersampling) m->s.supersampling = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
+    if (m->has_native_resolution &&
+        (m->s.internal_width < 1 || m->s.internal_width > 16384 ||
+         m->s.internal_height < 1 || m->s.internal_height > 16384)) {
+        m->s.internal_width = 1920;
+        m->s.internal_height = 1080;
+    }
+    if (m->has_supersampling)
+        m->s.supersampling = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
     if (launcher_model_has_aa_modes(m) &&
         (m->s.antialiasing < 0 || m->s.antialiasing > 5))
         m->s.antialiasing = 0;
@@ -1657,7 +1666,25 @@ const char* launcher_model_renderer_label(const LauncherModel* m) {
     return m->s.renderer ? "OpenGL" : "Software";
 }
 
+bool launcher_model_native_resolution_active(const LauncherModel* m) {
+    return m->has_native_resolution && m->s.renderer == m->native_resolution_renderer_index;
+}
+
 void launcher_model_cycle_supersampling(LauncherModel* m) {
+    if (launcher_model_native_resolution_active(m)) {
+        static const int sizes[][2] = {
+            {640, 480}, {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}
+        };
+        unsigned next = 0;
+        for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i)
+            if (m->s.internal_width == sizes[i][0] && m->s.internal_height == sizes[i][1]) {
+                next = (i + 1) % (sizeof(sizes) / sizeof(sizes[0]));
+                break;
+            }
+        m->s.internal_width = sizes[next][0];
+        m->s.internal_height = sizes[next][1];
+        return;
+    }
     int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
     m->s.supersampling = (v % 8) + 1;
 }
@@ -1669,8 +1696,11 @@ const char* launcher_model_supersampling_label(const LauncherModel* m) {
     static char buf[32];
     int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 8);
 
-    snprintf(buf, sizeof(buf), "%dx (%dx%d)", v,
-             InternalVramWidth * v, InternalVramHeight * v);
+    if (launcher_model_native_resolution_active(m))
+        snprintf(buf, sizeof(buf), "%d x %d", m->s.internal_width, m->s.internal_height);
+    else if (m->has_native_resolution) snprintf(buf, sizeof(buf), "%dx", v);
+    else snprintf(buf, sizeof(buf), "%dx (%dx%d)", v,
+                  InternalVramWidth * v, InternalVramHeight * v);
     return buf;
 }
 
@@ -1795,7 +1825,8 @@ void launcher_model_toggle_dithering(LauncherModel* m) {
  * corrected position rounds back to the pixel it came from. Say so in the UI
  * rather than letting the row look broken when someone ticks it at native res. */
 bool launcher_model_geometry_correction_inert(const LauncherModel* m) {
-    return m->s.geometry_correction && m->s.supersampling < 2;
+    return m->s.geometry_correction && !launcher_model_native_resolution_active(m) &&
+        m->s.supersampling < 2;
 }
 
 // Screen-model vocabulary: the active SystemProfile's own set when it has one
