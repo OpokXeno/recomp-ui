@@ -1085,10 +1085,6 @@ static std::vector<XgSection> xg_config_sections(LauncherModel* m) {
                                               nullptr, [m] { launcher_model_cycle_aa(m); }));
             }
         }
-        if (m->has_anisotropic_filtering)
-            s.rows.push_back(xg_cycle_row("Anisotropic filtering", [m] { return std::string(launcher_model_anisotropic_filtering_label(m)); },
-                "Sharper textures on floors and walls seen at an angle. Sprites and menus are unchanged.",
-                [m] { launcher_model_cycle_anisotropic_filtering(m); }));
         if (m->has_sharp_filter)
             s.rows.push_back(xg_cycle_row("Scaling filter", [m] { return std::string(ui_text(launcher_model_scaling_filter_label(m))); },
                                           nullptr, [m] { launcher_model_cycle_scaling_filter(m); }));

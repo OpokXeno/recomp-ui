@@ -393,7 +393,6 @@ typedef struct {
     bool     has_antialiasing;
     bool     has_texture_filter;
     bool     has_sprite_filter;
-    bool     has_anisotropic_filtering;
     bool     has_fmv_filter;
     bool     has_screen_kind;
     bool     has_frame_interp;
@@ -811,8 +810,6 @@ void launcher_model_toggle_texture_filter(LauncherModel* m);   // Nearest/Biline
 const char* launcher_model_texture_filter_label(const LauncherModel* m);
 void launcher_model_toggle_sprite_filter(LauncherModel* m);
 const char* launcher_model_sprite_filter_label(const LauncherModel* m);
-void launcher_model_cycle_anisotropic_filtering(LauncherModel* m);
-const char* launcher_model_anisotropic_filtering_label(const LauncherModel* m);
 // FMV reconstruction: Nearest/Bilinear/Sharp/Bicubic (wraps).
 void launcher_model_cycle_fmv_filter(LauncherModel* m);
 const char* launcher_model_fmv_filter_label(const LauncherModel* m);
